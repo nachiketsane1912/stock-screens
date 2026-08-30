@@ -1,6 +1,16 @@
+import pandas as pd
 import streamlit as st
 
-from data_loader import get_company_view, load_raw, macro_table
+from data_loader import (
+    MOAT_METRIC_CONFIG,
+    VIJAY_MALIK_CHECKS,
+    evaluate_screens_for_company,
+    get_company_view,
+    load_raw,
+    load_universe_cache,
+    macro_table,
+    merge_market_data,
+)
 
 st.title("Stock Fundamentals Explorer")
 
@@ -40,6 +50,45 @@ if symbol:
     view = get_company_view(symbol, sheets)
     st.subheader(f"{symbol} — {view['industry']}")
 
+    st.markdown("**Filters**")
+    universe = load_universe_cache()
+    if universe is None:
+        st.info("Run the Screens page (click Refresh if it's never been run) to see filter results here.")
+    else:
+        universe = merge_market_data(universe, sheets)
+        # Reads the plain "_saved" shadow keys pages/screens.py's widgets copy
+        # themselves into on every run, not the raw widget-bound keys — those
+        # aren't reliably preserved once navigated away from (see the comment
+        # in render_threshold_controls).
+        overrides = {
+            key: {
+                "use_industry": st.session_state.get(f"{key}_use_industry_saved", True),
+                "manual": st.session_state.get(f"{key}_manual_saved", int(config["default"])),
+            }
+            for key, config in MOAT_METRIC_CONFIG.items()
+        }
+        overrides["ccp"] = {
+            "roce": st.session_state.get("ccp_roce_threshold_saved", 15),
+            "growth": st.session_state.get("ccp_growth_threshold_saved", 10),
+            "years": st.session_state.get("ccp_years_saved", 10),
+        }
+        overrides["vijay_malik"] = {
+            check["key"]: st.session_state.get(f"vm_{check['key']}_saved", check["default"])
+            for check in VIJAY_MALIK_CHECKS
+        }
+        st.dataframe(
+            evaluate_screens_for_company(universe, symbol, overrides), use_container_width=True, hide_index=True
+        )
+
+    st.markdown("**Market**")
+    market = view["market"]
+    mcol1, mcol2, mcol3 = st.columns(3)
+    mcol1.metric("Price (₹)", f"{market['price']:.2f}" if pd.notna(market["price"]) else "—")
+    mcol2.metric("Market Cap (₹ Cr)", f"{market['market_cap_cr']:.2f}" if pd.notna(market["market_cap_cr"]) else "—")
+    mcol3.metric("P/E", f"{market['pe']:.2f}" if pd.notna(market["pe"]) else "—")
+    if pd.isna(market["price"]):
+        st.caption("Add a `Market` sheet (Symbol, CMP, PE, Market cap (INR Cr)) to Raw data.xlsx to see this.")
+
     st.markdown("**Quarterly financials**")
     st.dataframe(view["quarterly"], use_container_width=True)
 
@@ -54,19 +103,6 @@ if symbol:
 
     st.markdown("**Quarterly Revenue CAGR**")
     st.dataframe(view["quarterly_cagr"], use_container_width=True)
-
-    st.markdown("**SSGR Screen**")
-    screen = view["ssgr_screen"]
-    if screen["passes"] is None:
-        st.info("Not enough data to run the SSGR screen.")
-    else:
-        col1, col2 = st.columns(2)
-        col1.metric(f"SSGR (FY{screen['latest_year']})", f"{screen['ssgr_pct']:.2f}%")
-        col2.metric("Revenue 10Y CAGR", f"{screen['rev_cagr_10y_pct']:.2f}%")
-        if screen["passes"]:
-            st.success("Passes: SSGR is above the 10-year revenue CAGR.")
-        else:
-            st.error("Fails: SSGR is below the 10-year revenue CAGR.")
 
 st.header("Macro indicators")
 st.dataframe(macro_table(sheets), use_container_width=True)

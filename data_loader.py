@@ -6,6 +6,7 @@ this module is about getting the raw workbook into clean, usable pandas structur
 
 import os
 import re
+from functools import reduce
 
 import pandas as pd
 import streamlit as st
@@ -283,6 +284,8 @@ def add_capex_and_ratios(is_table: pd.DataFrame, bs_table: pd.DataFrame) -> pd.D
     CapexNI = Capex / Net * 100
     LiabEquity = (Borr + OL) / NetWorth * 100
     ROE = Net / NetWorth * 100
+    DebtEquity = Borr / NetWorth * 100   (borrowings only, unlike LiabEquity's
+        Borr + OL — this is the textbook "Debt/Equity", used by the Vijay Malik screen)
     """
     if is_table.empty or bs_table.empty:
         return is_table
@@ -298,6 +301,7 @@ def add_capex_and_ratios(is_table: pd.DataFrame, bs_table: pd.DataFrame) -> pd.D
     capex = ((nb_wip - prior_nb_wip) + dep_bs).reindex(is_table.columns)
 
     net_worth = (_numeric_row(bs_table, "Eq") + _numeric_row(bs_table, "Res")).reindex(is_table.columns)
+    borr = _numeric_row(bs_table, "Borr").reindex(is_table.columns)
     borr_ol = (_numeric_row(bs_table, "Borr") + _numeric_row(bs_table, "OL")).reindex(is_table.columns)
 
     is_table.loc["NetWorth"] = net_worth.round(2)
@@ -307,6 +311,7 @@ def add_capex_and_ratios(is_table: pd.DataFrame, bs_table: pd.DataFrame) -> pd.D
     is_table.loc["CapexNI"] = (_safe_divide(capex, net) * 100).round(2)
     is_table.loc["LiabEquity"] = (_safe_divide(borr_ol, net_worth) * 100).round(2)
     is_table.loc["ROE"] = (_safe_divide(net, net_worth) * 100).round(2)
+    is_table.loc["DebtEquity"] = (_safe_divide(borr, net_worth) * 100).round(2)
 
     return is_table
 
@@ -320,8 +325,9 @@ def add_roce(is_table: pd.DataFrame, bs_table: pd.DataFrame) -> pd.DataFrame:
          add_capex_and_ratios)
     CapitalEmployed = NB + WIP + Invest + WC
     ROCE = PBIT / CapitalEmployed * 100   (PBIT is EBIT under a different name)
-    CapitalEmployedExCash = CapitalEmployed - Cash   ("Nalanda's F" basis —
-        excludes cash, treated as non-operating surplus, from capital employed)
+    CapitalEmployedExCash = CapitalEmployed - Cash - Invest   ("Nalanda's F"
+        basis — excludes cash and investments, both treated as non-operating
+        surplus, from capital employed)
     ROCEExCash = PBIT / CapitalEmployedExCash * 100
     """
     if is_table.empty or bs_table.empty:
@@ -338,7 +344,7 @@ def add_roce(is_table: pd.DataFrame, bs_table: pd.DataFrame) -> pd.DataFrame:
 
     wc = oa - ol
     capital_employed = nb + wip + invest + wc
-    capital_employed_ex_cash = capital_employed - cash
+    capital_employed_ex_cash = capital_employed - cash - invest
 
     is_table.loc["WC"] = wc.round(2)
     is_table.loc["CapitalEmployed"] = capital_employed.round(2)
@@ -347,6 +353,29 @@ def add_roce(is_table: pd.DataFrame, bs_table: pd.DataFrame) -> pd.DataFrame:
     is_table.loc["ROCEExCash"] = (_safe_divide(pbit, capital_employed_ex_cash) * 100).round(2)
 
     return is_table
+
+
+def add_rev_growth(is_table: pd.DataFrame) -> pd.DataFrame:
+    """Add a RevGrowth row (year-over-year revenue growth, %) to an IS table.
+
+    RevGrowth = (Rev - prior year's Rev) / prior year's Rev * 100, via
+    .shift(-1) on IS's most-recent-first columns (same technique as Capex's
+    year-over-year diff). NaN for the oldest available year (no earlier year
+    to diff against) and for TTM (which isn't a fiscal year).
+    """
+    if is_table.empty:
+        return is_table
+
+    rev = _numeric_row(is_table, "Rev")
+    prior_rev = rev.shift(-1)
+    is_table.loc["RevGrowth"] = (_safe_divide(rev - prior_rev, prior_rev) * 100).round(2)
+
+    return is_table
+
+
+# Extra IS rows the CCP screen needs cached, beyond whatever MOAT_METRIC_CONFIG
+# already requires (ROCE/ROCEExCash are already covered via the Nalanda's F entries).
+CCP_EXTRA_CACHE_ROWS = {"RevGrowth"}
 
 
 def _cagr_pct(latest: float, base: float, years: float) -> float:
@@ -424,10 +453,11 @@ def get_company_view(symbol: str, sheets: dict[str, pd.DataFrame]) -> dict:
     income_statement = add_ssgr(income_statement, balance_sheet)
     income_statement = add_capex_and_ratios(income_statement, balance_sheet)
     income_statement = add_roce(income_statement, balance_sheet)
+    income_statement = add_rev_growth(income_statement)
 
     windows = (1, 3, 5, 10)
     annual_cagr = pd.concat([
-        build_cagr_table(income_statement, ["Rev", "Exp", "OP", "PBIT", "PBT"], windows, 1, "Y"),
+        build_cagr_table(income_statement, ["Rev", "Exp", "OP", "PBIT", "PBT", "Net"], windows, 1, "Y"),
         build_cagr_table(balance_sheet, ["NB", "Borr"], windows, 1, "Y"),
     ])
     quarterly_cagr = build_cagr_table(quarterly, ["Rev"], windows, 4, "Q")
@@ -440,6 +470,8 @@ def get_company_view(symbol: str, sheets: dict[str, pd.DataFrame]) -> dict:
         if pd.notna(latest_ssgr) and pd.notna(rev_cagr_10y)
         else None
     )
+
+    market = _company_market_data(symbol, sheets)
 
     return {
         "industry": industry,
@@ -454,7 +486,30 @@ def get_company_view(symbol: str, sheets: dict[str, pd.DataFrame]) -> dict:
             "rev_cagr_10y_pct": rev_cagr_10y,
             "passes": passes,
         },
+        "market": market,
     }
+
+
+def _company_market_data(symbol: str, sheets: dict[str, pd.DataFrame]) -> dict:
+    """Price, P/E and Market Cap for one company, read directly from the
+    optional `Market` sheet's `CMP`/`PE`/`Market cap (INR Cr)` columns (a data
+    vendor export, not derived by this app — it already knows actual current
+    shares outstanding and reported EPS, which we can't reproduce as
+    accurately from the annual workbook alone). Kept separate from the
+    once-a-year fundamentals cadence — see `merge_market_data()` for the
+    universe-wide equivalent of this same lookup.
+    """
+    price = pe = market_cap_cr = float("nan")
+    market_sheet = sheets.get("Market")
+    if market_sheet is not None:
+        match = market_sheet.loc[market_sheet["Symbol"] == symbol]
+        if not match.empty:
+            row = match.iloc[0]
+            price = pd.to_numeric(row.get("CMP"), errors="coerce")
+            pe = pd.to_numeric(row.get("PE"), errors="coerce")
+            market_cap_cr = pd.to_numeric(row.get("Market cap (INR Cr)"), errors="coerce")
+
+    return {"price": price, "pe": pe, "market_cap_cr": market_cap_cr}
 
 
 def build_universe_cache(
@@ -471,9 +526,16 @@ def build_universe_cache(
     config key — several screens can share one row, e.g. ROCE's Median and 10Y
     variants), "{row} Y1 (%)" .. "{row} Y10 (%)" — that row's value for the 10
     most recent completed fiscal years (Y1 = latest completed FY), NaN where
-    fewer than 10 years exist.
+    fewer than 10 years exist. Also includes three single-scalar columns for
+    the Vijay Malik screen: `Net 10Y CAGR (%)`, `DebtEquity Latest (%)`, `CFO
+    Latest (Cr)` (the latter two are the latest completed fiscal year's
+    value, not a 10-year history — that screen checks Debt/Equity and CFO as
+    a snapshot, not a consistency bar). Price/P·E/Market Cap are *not* here —
+    `merge_market_data()` reads those straight from the `Market` sheet on
+    every page load instead, since Price changes far more often than
+    fundamentals do.
     """
-    rows_needed = {config["row"] for config in MOAT_METRIC_CONFIG.values()}
+    rows_needed = {config["row"] for config in MOAT_METRIC_CONFIG.values()} | CCP_EXTRA_CACHE_ROWS
     symbols = sheets["Industry"]["Symbol"].dropna().unique()
     total = len(symbols)
     rows = []
@@ -481,7 +543,9 @@ def build_universe_cache(
         view = get_company_view(symbol, sheets)
         screen = view["ssgr_screen"]
         income_statement = view["income_statement"]
+        balance_sheet = view["balance_sheet"]
         annual_cols = [c for c in income_statement.columns if c != "TTM"]
+        annual_bs_cols = list(balance_sheet.columns)
 
         row = {
             "Symbol": symbol,
@@ -489,6 +553,11 @@ def build_universe_cache(
             "SSGR (%)": screen["ssgr_pct"],
             "Rev 10Y CAGR (%)": screen["rev_cagr_10y_pct"],
             "SSGR Passes": screen["passes"],
+            "Net 10Y CAGR (%)": view["cagr"].loc["Net", "10Y"] if "Net" in view["cagr"].index else float("nan"),
+            "DebtEquity Latest (%)": income_statement.loc["DebtEquity", annual_cols[0]]
+            if "DebtEquity" in income_statement.index and annual_cols else float("nan"),
+            "CFO Latest (Cr)": balance_sheet.loc["CFO", annual_bs_cols[0]]
+            if "CFO" in balance_sheet.index and annual_bs_cols else float("nan"),
         }
         for is_row in rows_needed:
             row_values = _numeric_row(income_statement, is_row)
@@ -499,6 +568,36 @@ def build_universe_cache(
         if progress_callback and (i % 25 == 0 or i == total - 1):
             progress_callback(i + 1, total)
     return pd.DataFrame(rows)
+
+
+def merge_market_data(universe: pd.DataFrame, sheets: dict[str, pd.DataFrame]) -> pd.DataFrame:
+    """Join the optional `Market` sheet's Price/P·E/Market Cap onto `universe`
+    by Symbol. Reads `CMP`/`PE`/`Market cap (INR Cr)` directly (a data
+    vendor's own export — it already knows real current shares outstanding
+    and reported EPS, which this app can't reproduce as accurately from the
+    annual workbook alone) rather than deriving them from fundamentals.
+    Deliberately uncached and cheap (a plain merge, not the 53s per-company
+    loop) so callers can run it on every page load and always see today's
+    Price, independent of the once-a-year `universe_cache.csv` cadence.
+    """
+    result = universe.copy()
+
+    market_sheet = sheets.get("Market")
+    if market_sheet is None:
+        result["Price"] = float("nan")
+        result["Market Cap (Cr)"] = float("nan")
+        result["PE"] = float("nan")
+        return result
+
+    market_cols = market_sheet[["Symbol", "CMP", "PE", "Market cap (INR Cr)"]].rename(
+        columns={"CMP": "Price", "Market cap (INR Cr)": "Market Cap (Cr)"}
+    )
+    result = result.merge(market_cols, on="Symbol", how="left")
+    result["Price"] = pd.to_numeric(result["Price"], errors="coerce")
+    result["PE"] = pd.to_numeric(result["PE"], errors="coerce")
+    result["Market Cap (Cr)"] = pd.to_numeric(result["Market Cap (Cr)"], errors="coerce")
+
+    return result
 
 
 def industry_metric_thresholds(
@@ -529,19 +628,27 @@ def industry_metric_thresholds(
 
 
 def metric_moat_passes(
-    universe: pd.DataFrame, row: str, thresholds: pd.Series, direction: str = "higher", consistency: str = "all_years"
+    universe: pd.DataFrame,
+    row: str,
+    thresholds: pd.Series,
+    direction: str = "higher",
+    consistency: str = "all_years",
+    years: int = 10,
 ) -> pd.Series:
     """Tri-state (True/False/pd.NA) verdict for one screen reading IS row `row`.
 
-    `consistency="all_years"`: every one of the last 10 completed-FY values
-    must clear the (per-row) threshold — above it for `direction="higher"`,
-    below it for `"lower"`. `consistency="median"`: the *median* of the last 10
-    years must clear it instead — a "typical year" rather than "every year"
-    bar. Either way, NA if any of the 10 years is missing (not enough history
-    for a real verdict), matching the SSGR screen's None-for-insufficient-data
-    convention — a median still needs the full 10-year window to mean that.
+    `consistency="all_years"`: every one of the last `years` completed-FY
+    values must clear the (per-row) threshold — above it for
+    `direction="higher"`, below it for `"lower"`. `consistency="median"`: the
+    *median* of the last `years` years must clear it instead — a "typical
+    year" rather than "every year" bar. Either way, NA if any of the `years`
+    years is missing (not enough history for a real verdict), matching the
+    SSGR screen's None-for-insufficient-data convention — a median still needs
+    the full window to mean that. `years` defaults to 10 (every screen so far
+    uses the full window the universe cache stores; CCP is the first to let
+    the user shrink it).
     """
-    cols = [f"{row} Y{y} (%)" for y in range(1, 11)]
+    cols = [f"{row} Y{y} (%)" for y in range(1, years + 1)]
     has_full_history = universe[cols].notna().all(axis=1)
     if consistency == "median":
         value = universe[cols].median(axis=1)
@@ -555,6 +662,64 @@ def metric_moat_passes(
     return result
 
 
+def scalar_metric_passes(values: pd.Series, threshold: float, direction: str = "higher") -> pd.Series:
+    """Tri-state (True/False/pd.NA) verdict for a single-scalar-per-company
+    column (not a `Y1..Y10` history) — e.g. an already-computed 10Y CAGR, a
+    latest-year ratio, or Market Cap. The scalar equivalent of
+    `metric_moat_passes`, used by the Vijay Malik screen where each of the 5
+    checks is one column, not a 10-year series.
+    """
+    meets_bar = values.gt(threshold) if direction == "higher" else values.lt(threshold)
+    result = pd.Series(pd.NA, index=values.index, dtype=object)
+    has_value = values.notna()
+    result[has_value] = meets_bar[has_value]
+    return result
+
+
+# The Vijay Malik screen: 5 fixed-threshold checks, each reading one
+# already-computed scalar column (never a Y1..Y10 history) — "direction"
+# controls both the default sense of the comparison and how a failure reads
+# ("above"/"below" the threshold); "unit" is just for display/failure text.
+VIJAY_MALIK_CHECKS = [
+    {"key": "sales_cagr", "label": "Sales CAGR (10Y)", "column": "Rev 10Y CAGR (%)", "direction": "higher", "unit": "%", "default": 15.0},
+    {"key": "net_cagr", "label": "Net Profit CAGR (10Y)", "column": "Net 10Y CAGR (%)", "direction": "higher", "unit": "%", "default": 30.0},
+    {"key": "debt_equity", "label": "Debt/Equity", "column": "DebtEquity Latest (%)", "direction": "lower", "unit": "%", "default": 100.0},
+    {"key": "cfo", "label": "CFO (Latest Year)", "column": "CFO Latest (Cr)", "direction": "higher", "unit": " Cr", "default": 0.0},
+    {"key": "market_cap", "label": "Market Cap", "column": "Market Cap (Cr)", "direction": "higher", "unit": " Cr", "default": 500.0},
+]
+
+
+def vijay_malik_passes(universe: pd.DataFrame, thresholds: dict) -> tuple[dict[str, pd.Series], pd.Series]:
+    """Tri-state pass/fail for each of the 5 VIJAY_MALIK_CHECKS (`thresholds`
+    keyed by each check's "key", falling back to its "default"), plus the
+    combined AND of all 5 (via and_tri_state, folded pairwise).
+    """
+    per_check = {
+        check["key"]: scalar_metric_passes(
+            pd.to_numeric(universe[check["column"]], errors="coerce"),
+            thresholds.get(check["key"], check["default"]),
+            check["direction"],
+        )
+        for check in VIJAY_MALIK_CHECKS
+    }
+    combined = reduce(and_tri_state, per_check.values())
+    return per_check, combined
+
+
+def and_tri_state(a: pd.Series, b: pd.Series) -> pd.Series:
+    """Three-valued AND of two tri-state (True/False/pd.NA) Series: False
+    dominates (even over the other side's NA, since AND-ing with a definite
+    False can never become True); otherwise NA if either side is NA; True only
+    if both sides are True.
+    """
+    both_true = (a == True) & (b == True)  # noqa: E712
+    either_false = (a == False) | (b == False)  # noqa: E712
+    result = pd.Series(pd.NA, index=a.index, dtype=object)
+    result[both_true] = True
+    result[either_false & ~both_true] = False
+    return result
+
+
 def moat_score(passes_by_metric: dict[str, pd.Series]) -> pd.Series:
     """Sum of how many of the given per-metric pass Series are exactly True,
     per row. A metric with pd.NA (not enough data) or False contributes 0.
@@ -565,6 +730,140 @@ def moat_score(passes_by_metric: dict[str, pd.Series]) -> pd.Series:
     for passes in metrics:
         score = score + (passes == True).astype("int64")  # noqa: E712 (NA/False must not match)
     return score
+
+
+def failure_detail(values: pd.Series, threshold: float, direction: str, consistency: str) -> str:
+    """Explain why one company's screen check failed. `values` is that
+    company's already-sliced Y1..Y{years} values for the row in question,
+    with no missing years (call this only when the verdict is a definite
+    False, not NA — a missing year means "not enough data", a different
+    message the caller already handles).
+    """
+    if consistency == "median":
+        median = values.median()
+        return f"median {median:.2f}% vs threshold {threshold:.2f}%"
+
+    cmp = (lambda v: v > threshold) if direction == "higher" else (lambda v: v < threshold)
+    failing = [(y, v) for y, v in zip(range(1, len(values) + 1), values) if not cmp(v)]
+    parts = ", ".join(f"Y{y} ({v:.2f}%)" for y, v in failing)
+    return f"fails in {len(failing)}/{len(values)} year(s): {parts}"
+
+
+def evaluate_screens_for_company(universe: pd.DataFrame, symbol: str, overrides: dict) -> pd.DataFrame:
+    """Evaluate every screen (SSGR, all MOAT_METRIC_CONFIG entries, the 2 CCP
+    lists, and Vijay Malik) for one company, using the same formulas
+    `pages/screens.py` uses for the whole universe. `overrides` (resolved by
+    the caller from st.session_state, kept out of this function to stay
+    UI-free): {config_key: {"use_industry": bool, "manual": float}} for every
+    MOAT_METRIC_CONFIG key, plus "ccp": {"roce": float, "growth": float,
+    "years": int} and "vijay_malik": {check["key"]: float, ...} for each of
+    VIJAY_MALIK_CHECKS. Returns one row per screen: Filter, Group, Passes
+    (True/False/pd.NA), Detail ("—" if passing, "not enough history"/"not
+    enough data" if NA, else a failure explanation).
+    """
+    columns = ["Filter", "Group", "Passes", "Detail"]
+    match = universe.loc[universe["Symbol"] == symbol]
+    if match.empty:
+        rows = [
+            (label, group, pd.NA, "not in Screens cache — click Refresh on the Screens page")
+            for label, group in [("SSGR", "SSGR")]
+            + [(cfg["label"], "Moats" if cfg["group"] == "moats" else "Nalanda's F") for cfg in MOAT_METRIC_CONFIG.values()]
+            + [("CCP – Regular ROCE", "CCP"), ("CCP – Nalanda's F", "CCP"), ("Vijay Malik", "Vijay Malik")]
+        ]
+        return pd.DataFrame(rows, columns=columns)
+
+    idx = match.index[0]
+    urow = match.iloc[0]
+    rows = []
+
+    ssgr_pct, rev_cagr = urow["SSGR (%)"], urow["Rev 10Y CAGR (%)"]
+    ssgr_passes = urow["SSGR Passes"]
+    if pd.isna(ssgr_passes):
+        ssgr_detail = "not enough history"
+    elif ssgr_passes:
+        ssgr_detail = "—"
+    else:
+        ssgr_detail = f"SSGR {ssgr_pct:.2f}% is not above the 10-year revenue CAGR {rev_cagr:.2f}%"
+    rows.append(("SSGR", "SSGR", ssgr_passes, ssgr_detail))
+
+    for key, config in MOAT_METRIC_CONFIG.items():
+        row_name = config["row"]
+        override = overrides.get(key, {})
+        use_industry = override.get("use_industry", True)
+        manual = override.get("manual", config["default"])
+        if use_industry:
+            thresholds = industry_metric_thresholds(
+                universe, row_name, config["percentile"], fallback=manual, consistency=config["consistency"]
+            )
+        else:
+            thresholds = pd.Series(manual, index=universe.index)
+        passes_all = metric_moat_passes(universe, row_name, thresholds, config["direction"], config["consistency"])
+        passes = passes_all.loc[idx]
+        threshold_value = thresholds.loc[idx]
+
+        if pd.isna(passes):
+            detail = "not enough history"
+        elif passes:
+            detail = "—"
+        else:
+            values = pd.to_numeric(urow[[f"{row_name} Y{y} (%)" for y in range(1, 11)]], errors="coerce")
+            detail = failure_detail(values, threshold_value, config["direction"], config["consistency"])
+
+        group = "Moats" if config["group"] == "moats" else "Nalanda's F"
+        rows.append((config["label"], group, passes, detail))
+
+    ccp = overrides.get("ccp", {})
+    roce_threshold = ccp.get("roce", 15)
+    growth_threshold = ccp.get("growth", 10)
+    years = ccp.get("years", 10)
+    roce_thresh_s = pd.Series(roce_threshold, index=universe.index)
+    growth_thresh_s = pd.Series(growth_threshold, index=universe.index)
+    growth_passes_all = metric_moat_passes(universe, "RevGrowth", growth_thresh_s, "higher", "all_years", years)
+
+    for label, roce_row in [("CCP – Regular ROCE", "ROCE"), ("CCP – Nalanda's F", "ROCEExCash")]:
+        roce_passes_all = metric_moat_passes(universe, roce_row, roce_thresh_s, "higher", "all_years", years)
+        combined = and_tri_state(roce_passes_all, growth_passes_all)
+        passes = combined.loc[idx]
+
+        if pd.isna(passes):
+            detail = "not enough history"
+        elif passes:
+            detail = "—"
+        else:
+            reasons = []
+            if roce_passes_all.loc[idx] is False:
+                values = pd.to_numeric(urow[[f"{roce_row} Y{y} (%)" for y in range(1, years + 1)]], errors="coerce")
+                reasons.append(f"ROCE: {failure_detail(values, roce_threshold, 'higher', 'all_years')}")
+            if growth_passes_all.loc[idx] is False:
+                values = pd.to_numeric(urow[[f"RevGrowth Y{y} (%)" for y in range(1, years + 1)]], errors="coerce")
+                reasons.append(f"Revenue growth: {failure_detail(values, growth_threshold, 'higher', 'all_years')}")
+            detail = "; ".join(reasons) if reasons else "not enough history"
+
+        rows.append((label, "CCP", passes, detail))
+
+    vm_thresholds = overrides.get("vijay_malik", {})
+    vm_per_check, vm_combined = vijay_malik_passes(universe, vm_thresholds)
+    vm_passes = vm_combined.loc[idx]
+
+    if pd.isna(vm_passes):
+        vm_detail = "not enough data"
+    elif vm_passes:
+        vm_detail = "—"
+    else:
+        reasons = []
+        for check in VIJAY_MALIK_CHECKS:
+            if vm_per_check[check["key"]].loc[idx] is False:
+                value = pd.to_numeric(pd.Series([urow[check["column"]]]), errors="coerce").iloc[0]
+                threshold = vm_thresholds.get(check["key"], check["default"])
+                cmp_word = "above" if check["direction"] == "higher" else "below"
+                reasons.append(
+                    f"{check['label']}: {value:.2f}{check['unit']} is not {cmp_word} the threshold {threshold:.2f}{check['unit']}"
+                )
+        vm_detail = "; ".join(reasons) if reasons else "not enough data"
+
+    rows.append(("Vijay Malik", "Vijay Malik", vm_passes, vm_detail))
+
+    return pd.DataFrame(rows, columns=columns)
 
 
 def load_universe_cache(path: str = UNIVERSE_CACHE_FILE) -> pd.DataFrame | None:

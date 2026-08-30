@@ -8,8 +8,8 @@ A Streamlit app for exploring the fundamentals of a universe of stocks (quarterl
 - **Screens** — run the same metrics across the entire universe of companies:
   - **SSGR** — Self-Sustainable Growth Rate vs. 10-year revenue CAGR (did the company grow organically, without needing external capital?).
   - **Moats** — 7 quality screens (Operating Margin, Net Margin, Interest/Operating Profit, Capex/Revenue, Capex/Net Income, Liabilities/Equity, ROE), each checked for consistency over the last 10 fiscal years, with a combined 0–7 score and ranking.
-  - **Nalanda's F** — 4 ROCE-based filters (ROCE and ROCE excluding excess cash, each checked as a 10-year median and as an every-year-of-10 bar).
-  - Every threshold defaults to your own industry peers' percentile, with a manual override slider. Click any row in a results table to jump straight to that company in the Data Explorer.
+  - **Nalanda's F** — 4 ROCE-based filters (ROCE and ROCE excluding excess cash, each checked as a 10-year median and as an every-year-of-10 bar), against a manual threshold.
+  - Moats thresholds default to your own industry peers' percentile, with a manual override slider; Nalanda's F uses a manual threshold only (no industry-relative option). Click any row in a results table to jump straight to that company in the Data Explorer.
 
 ## Getting started
 
@@ -40,7 +40,7 @@ pytest tests/ -v
 
 ## Data file format
 
-The app reads everything from one Excel workbook, **`Raw data.xlsx`**, placed in the project root. It must contain five sheets: `Industry`, `Quarter`, `IS`, `BS`, `Macro`. The literal string `"NA"` anywhere in the workbook is treated as a missing value.
+The app reads everything from one Excel workbook, **`Raw data.xlsx`**, placed in the project root. It must contain five sheets: `Industry`, `Quarter`, `IS`, `BS`, `Macro`, plus an optional sixth, `Market`. The literal string `"NA"` anywhere in the workbook is treated as a missing value.
 
 ### `Industry` sheet
 
@@ -91,6 +91,18 @@ Example `IS` row:
 | `CFO` / `CFI` / `CFF` | Cash flow from operating / investing / financing activities | BS | ₹ crore |
 
 > **Important:** `Rec`, `Inv` and `Cash` are informational sub-breakdowns already folded into `OA` — don't expect `OA` to equal `Rec + Inv + Cash + other assets` on top of itself; `OA` **is** the total, and `NB + WIP + Invest + OA` should balance against `Eq + Res + Borr + OL` (Total Assets = Total Liabilities).
+
+### `Market` sheet (optional)
+
+One row per company — typically pasted straight from a data vendor export, as often as you like (daily, if you want current P/E and Market Cap):
+
+| Symbol | CMP | PE | Market cap (INR Cr) | Beta |
+|---|---|---|---|---|
+| AAVAS | 1450.5 | 22.3 | 11800.0 | 0.9 |
+
+- `CMP`, `PE`, and `Market cap (INR Cr)` are read directly, as-is — the app doesn't recompute them from the annual financials (your vendor's numbers already reflect actual current shares outstanding and reported EPS, which this app can't reproduce as accurately). `Beta` isn't currently used by any screen.
+- There's no date column — the app always uses whatever was last saved, so staleness is on you to manage, unlike the annual/quarterly sheets.
+- If this sheet is missing entirely, or a symbol isn't in it, Price/Market Cap/P·E just show as unavailable — nothing else in the app depends on it.
 
 ### `Macro` sheet
 
