@@ -8,6 +8,7 @@ from data_loader import (
     MOAT_METRIC_CONFIG,
     UNIVERSE_CACHE_FILE,
     VIJAY_MALIK_CHECKS,
+    VIJAY_MALIK_PRO_CHECKS,
     and_tri_state,
     build_universe_cache,
     industry_metric_thresholds,
@@ -22,6 +23,7 @@ from data_loader import (
     scalar_metric_passes,
     vantage_metrics,
     vijay_malik_passes,
+    vijay_malik_pro_passes,
 )
 
 st.title("Screens")
@@ -404,6 +406,96 @@ def render_vijay_malik_tab(universe: pd.DataFrame) -> None:
     drill_through(event, passing)
 
 
+def render_vijay_malik_pro_tab(universe: pd.DataFrame) -> None:
+    """Vijay Malik Pro: a more detailed, 9-check version of the checklist,
+    scored 0-9 (moat_score, one point per check cleared) and ranked — same
+    shape as the Moats tab's 7 distinct traits — rather than AND-ed into one
+    pass/fail like the original Vijay Malik tab. Bespoke rather than reusing
+    render_screen_group_tab, since that helper assumes every check is an
+    industry-relative Y1..Y10 (%) row; these checks mix latest-year scalars,
+    a 10-year consistency bar, and one two-sided range, with non-% units.
+    """
+    st.subheader("Vijay Malik Pro")
+    st.caption(
+        "A more detailed, 9-parameter version of the Vijay Malik checklist: each company is scored 0-9 "
+        "(one point per check cleared) and ranked, instead of requiring every check to pass."
+    )
+
+    thresholds: dict = {}
+    with st.expander("Configure thresholds"):
+        for check in VIJAY_MALIK_PRO_CHECKS:
+            key = check["key"]
+            label_col, control_col = st.columns([2, 5])
+            label_col.markdown(f"**{check['label']}**")
+            if check["type"] == "range":
+                low, high = control_col.slider(
+                    "Range (%)",
+                    min_value=0,
+                    max_value=100,
+                    value=(int(check["default_min"]), int(check["default_max"])),
+                    key=f"vmpro_{key}",
+                    label_visibility="collapsed",
+                )
+                thresholds[f"{key}_min"], thresholds[f"{key}_max"] = float(low), float(high)
+                st.session_state[f"vmpro_{key}_min_saved"] = thresholds[f"{key}_min"]
+                st.session_state[f"vmpro_{key}_max_saved"] = thresholds[f"{key}_max"]
+            elif check["unit"] == "%":
+                value = control_col.slider(
+                    "Threshold (%)",
+                    min_value=0,
+                    max_value=200,
+                    value=int(check["default"]),
+                    key=f"vmpro_{key}",
+                    label_visibility="collapsed",
+                )
+                thresholds[key] = float(value)
+                st.session_state[f"vmpro_{key}_saved"] = thresholds[key]
+            else:
+                unit = check["unit"].strip()
+                step = 10.0 if unit == "Cr" else 0.25
+                value = control_col.number_input(
+                    f"Threshold ({unit})",
+                    value=float(check["default"]),
+                    step=step,
+                    key=f"vmpro_{key}",
+                    label_visibility="collapsed",
+                )
+                thresholds[key] = float(value)
+                st.session_state[f"vmpro_{key}_saved"] = thresholds[key]
+
+    per_check = vijay_malik_pro_passes(universe, thresholds)
+
+    ranking = universe[["Symbol", "Industry"]].copy()
+    ranking["Score"] = moat_score(per_check)
+    for check in VIJAY_MALIK_PRO_CHECKS:
+        ranking[check["label"]] = per_check[check["key"]]
+    ranking = ranking.sort_values(["Score", "Symbol"], ascending=[False, True])
+
+    search = st.text_input("Search by symbol or industry", key="vmpro_search")
+    min_score = st.slider(
+        "Minimum score", min_value=0, max_value=len(VIJAY_MALIK_PRO_CHECKS), value=0, key="vmpro_min_score"
+    )
+
+    filtered = ranking[ranking["Score"] >= min_score]
+    if search:
+        mask = filtered["Symbol"].str.contains(search, case=False, na=False) | filtered["Industry"].str.contains(
+            search, case=False, na=False
+        )
+        filtered = filtered[mask]
+
+    st.caption(f"{len(filtered)} of {len(ranking)} companies")
+
+    event = st.dataframe(
+        filtered,
+        use_container_width=True,
+        hide_index=True,
+        on_select="rerun",
+        selection_mode="single-row",
+        key="vmpro_table",
+    )
+    drill_through(event, filtered)
+
+
 def render_net_net_tab(universe: pd.DataFrame) -> None:
     """Net-Net (Benjamin Graham NCAV) tab: two lists, each Market Cap below a
     Net Current Asset Value basis, sharing one Market Cap floor — same "two
@@ -539,7 +631,9 @@ def render_magic_formula_tab(universe: pd.DataFrame) -> None:
         "whether Working Capital excludes cash."
     )
 
-    min_market_cap = st.number_input("Min Market Cap (₹ Cr)", value=0.0, step=10.0, key="magic_formula_min_market_cap")
+    min_market_cap = st.number_input(
+        "Min Market Cap (₹ Cr)", value=5000.0, step=10.0, key="magic_formula_min_market_cap"
+    )
 
     # Shadow-copy into a plain key, same fix as every other screen's controls,
     # so the Data Explorer page's Filters section reads the current setting reliably.
@@ -572,8 +666,18 @@ def render_magic_formula_tab(universe: pd.DataFrame) -> None:
 moats_configs = {k: v for k, v in MOAT_METRIC_CONFIG.items() if v["group"] == "moats"}
 nalanda_configs = {k: v for k, v in MOAT_METRIC_CONFIG.items() if v["group"] == "nalanda"}
 
-tab_ssgr, tab_moats, tab_nalanda, tab_ccp, tab_vijay_malik, tab_net_net, tab_vantage, tab_magic_formula = st.tabs(
-    ["SSGR", "Moats", "Nalanda's F", "CCP", "Vijay Malik", "Net-Net", "Vantage", "Magic Formula"]
+(
+    tab_ssgr,
+    tab_moats,
+    tab_nalanda,
+    tab_ccp,
+    tab_vijay_malik,
+    tab_vijay_malik_pro,
+    tab_net_net,
+    tab_vantage,
+    tab_magic_formula,
+) = st.tabs(
+    ["SSGR", "Moats", "Nalanda's F", "CCP", "Vijay Malik", "Vijay Malik Pro", "Net-Net", "Vantage", "Magic Formula"]
 )
 
 with tab_ssgr:
@@ -613,6 +717,9 @@ with tab_ccp:
 
 with tab_vijay_malik:
     render_vijay_malik_tab(universe)
+
+with tab_vijay_malik_pro:
+    render_vijay_malik_pro_tab(universe)
 
 with tab_net_net:
     render_net_net_tab(universe)

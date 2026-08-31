@@ -15,6 +15,7 @@ from data_loader import (
     add_ttm_column,
     and_tri_state,
     build_cagr_table,
+    build_trend_frame,
     build_universe_cache,
     company_metric_table,
     company_vantage_metrics,
@@ -32,6 +33,7 @@ from data_loader import (
     scalar_metric_passes,
     vantage_metrics,
     vijay_malik_passes,
+    vijay_malik_pro_passes,
     weighted_average_by_year,
 )
 
@@ -191,7 +193,7 @@ def test_add_capex_and_ratios_matches_hand_computed_values():
     # diff against, so it (and anything derived from it) is NaN for the oldest "25".
     is_table = make_table(
         {"Rev": [1000.0, 900.0], "Net": [150.0, 120.0], "Dep": [30.0, 25.0],
-         "OP": [300.0, 270.0], "Int": [45.0, 40.0]},
+         "OP": [300.0, 270.0], "Int": [45.0, 40.0], "PBIT": [280.0, 200.0], "PBT": [235.0, 160.0]},
         columns=["26", "25"],
     )
     bs_table = make_table(
@@ -211,6 +213,8 @@ def test_add_capex_and_ratios_matches_hand_computed_values():
     assert result.loc["ROE", "26"] == 30.0  # 150/500*100
     assert result.loc["DebtEquity", "26"] == 30.0  # 150/500*100 (Borr alone, no OL)
     assert result.loc["TotalLiabExEquity", "26"] == 200.0  # 150+50
+    assert result.loc["TaxPayoutRatio", "26"] == pytest.approx(round(85 / 235 * 100, 2))  # (235-150)/235*100
+    assert result.loc["InterestCoverage", "26"] == pytest.approx(round(280 / 45, 2))  # PBIT/Int
 
     # Oldest year: Capex undefined (no earlier year), but LowDebt/LiabEquity/ROE
     # don't depend on Capex, so they're still computed.
@@ -222,6 +226,8 @@ def test_add_capex_and_ratios_matches_hand_computed_values():
     assert result.loc["ROE", "25"] == pytest.approx(round(120 / 450 * 100, 2))
     assert result.loc["DebtEquity", "25"] == pytest.approx(round(140 / 450 * 100, 2))
     assert result.loc["TotalLiabExEquity", "25"] == 185.0  # 140+45
+    assert result.loc["TaxPayoutRatio", "25"] == 25.0  # (160-120)/160*100
+    assert result.loc["InterestCoverage", "25"] == 5.0  # 200/40
 
 
 # --- add_roce ------------------------------------------------------------------------
@@ -246,6 +252,7 @@ def test_add_roce_matches_hand_computed_values():
     assert result.loc["NCAVCashInvRec", "26"] == 100.0  # (40+80+90)-(60+50)
     assert result.loc["MagicROC", "26"] == 100.0  # 200/(100+100)*100
     assert result.loc["MagicROCExCash", "26"] == 125.0  # 200/(100+100-40)*100
+    assert result.loc["CurrentRatio", "26"] == 3.0  # 150/50
 
     assert result.loc["WC", "25"] == 80.0  # 120-40
     assert result.loc["CapitalEmployed", "25"] == 210.0  # 90+15+25+80
@@ -256,6 +263,7 @@ def test_add_roce_matches_hand_computed_values():
     assert result.loc["NCAVCashInvRec", "25"] == 85.0  # (30+70+80)-(55+40)
     assert result.loc["MagicROC", "25"] == pytest.approx(round(150 / (90 + 80) * 100, 2))
     assert result.loc["MagicROCExCash", "25"] == pytest.approx(round(150 / (90 + 80 - 30) * 100, 2))
+    assert result.loc["CurrentRatio", "25"] == 3.0  # 120/40
 
     # Excluding cash can only raise (or leave unchanged) ROCE.
     assert result.loc["ROCEExCash", "26"] >= result.loc["ROCE", "26"]
@@ -317,6 +325,25 @@ def test_build_cagr_table_insufficient_history_is_nan():
     result = build_cagr_table(table, ["Rev"], (1, 5), periods_per_year=1, unit_suffix="Y")
     assert result.loc["Rev", "1Y"] == 100.0
     assert pd.isna(result.loc["Rev", "5Y"])
+
+
+# --- build_trend_frame ---------------------------------------------------------
+
+def test_build_trend_frame_orders_chronologically_and_drops_ttm():
+    table = make_table({"Rev": [999.0, 800.0, 400.0, 200.0]}, columns=["TTM", "26", "25", "24"])
+    result = build_trend_frame(table, ["Rev"])
+    assert list(result.index) == ["24", "25", "26"]
+    assert "TTM" not in result.index
+    assert result.loc["24", "Rev"] == 200.0
+    assert result.loc["25", "Rev"] == 400.0
+    assert result.loc["26", "Rev"] == 800.0
+
+
+def test_build_trend_frame_missing_row_is_all_nan():
+    table = make_table({"Rev": [800.0, 400.0]}, columns=["26", "25"])
+    result = build_trend_frame(table, ["Rev", "ROE"])
+    assert list(result.columns) == ["Rev", "ROE"]
+    assert result["ROE"].isna().all()
 
 
 # --- get_company_view (integration) ---------------------------------------------------
@@ -534,6 +561,7 @@ def test_build_universe_cache_returns_one_row_per_symbol_and_reports_progress():
         "Net 10Y CAGR (%)", "DebtEquity Latest (%)", "CFO Latest (Cr)", "NCAV Latest (Cr)",
         "NCAVCashInvRec Latest (Cr)", "Cash Latest (Cr)",
         "PBIT Latest (Cr)", "TotalLiabExEquity Latest (Cr)", "MagicROC Latest (%)", "MagicROCExCash Latest (%)",
+        "TaxPayoutRatio Latest (%)", "InterestCoverage Latest (x)", "CurrentRatio Latest (x)",
     }
     expected_cols |= {f"Int Y{y} (Cr)" for y in range(1, 11)} | {f"CFO Y{y} (Cr)" for y in range(1, 11)}
     rows_needed = {config["row"] for config in MOAT_METRIC_CONFIG.values()} | CCP_EXTRA_CACHE_ROWS
@@ -673,6 +701,22 @@ def test_metric_moat_passes_custom_years_window():
     assert result_10y.iloc[0] is False
 
 
+def test_metric_moat_passes_custom_unit_reads_non_percent_columns():
+    # CFO is cached as "CFO Y1 (Cr)".."CFO Y10 (Cr)", not "(%)" — unit="Cr" must
+    # read those columns, and the default unit="%" must be unaffected.
+    universe = pd.DataFrame({
+        "Symbol": ["ALWAYS_POSITIVE", "ONE_NEGATIVE"],
+        **{f"CFO Y{y} (Cr)": [100.0, 100.0] for y in range(1, 11)},
+    })
+    universe.loc[universe["Symbol"] == "ONE_NEGATIVE", "CFO Y4 (Cr)"] = -5.0
+
+    thresholds = pd.Series(0.0, index=universe.index)
+    result = metric_moat_passes(universe, "CFO", thresholds, direction="higher", unit="Cr")
+
+    assert result[universe["Symbol"] == "ALWAYS_POSITIVE"].iloc[0] is True
+    assert result[universe["Symbol"] == "ONE_NEGATIVE"].iloc[0] is False
+
+
 def test_industry_metric_thresholds_median_consistency_uses_10_year_median_not_y1():
     # Each company's Y1 is a wild outlier (999); Y2-Y10 all equal that company's
     # "true" target value, so the 10-year median is the target, not Y1.
@@ -752,6 +796,72 @@ def test_vijay_malik_passes_missing_value_is_na_unless_another_check_fails():
 
     assert pd.isna(per_check["cfo"].iloc[0])
     assert pd.isna(combined.iloc[0])
+
+
+# --- vijay_malik_pro_passes -----------------------------------------------------------
+
+def _vmp_universe(**overrides) -> pd.DataFrame:
+    row = {
+        "Symbol": ["AAA"],
+        "Rev 10Y CAGR (%)": [20.0],
+        "Net 10Y CAGR (%)": [40.0],
+        "DebtEquity Latest (%)": [40.0],
+        "Market Cap (Cr)": [1000.0],
+        "TaxPayoutRatio Latest (%)": [27.0],
+        "InterestCoverage Latest (x)": [5.0],
+        "CurrentRatio Latest (x)": [1.5],
+    }
+    npm_values = overrides.pop("NPM", [30.0] * 10)
+    cfo_values = overrides.pop("CFO", [100.0] * 10)
+    for y in range(1, 11):
+        row[f"NPM Y{y} (%)"] = [npm_values[y - 1]]
+        row[f"CFO Y{y} (Cr)"] = [cfo_values[y - 1]]
+    row.update({k: [v] for k, v in overrides.items()})
+    return pd.DataFrame(row)
+
+
+def test_vijay_malik_pro_passes_all_clear_scores_nine():
+    universe = _vmp_universe()
+
+    per_check = vijay_malik_pro_passes(universe, {})
+
+    assert all(series.iloc[0] is True for series in per_check.values())
+    assert moat_score(per_check).iloc[0] == 9
+
+
+def test_vijay_malik_pro_passes_scalar_failure():
+    universe = _vmp_universe(**{"Market Cap (Cr)": 10.0})
+
+    per_check = vijay_malik_pro_passes(universe, {})
+
+    assert per_check["market_cap"].iloc[0] is False
+    assert moat_score(per_check).iloc[0] == 8
+
+
+def test_vijay_malik_pro_passes_consistency_failure_one_bad_year():
+    universe = _vmp_universe(NPM=[30.0, 30.0, 30.0, 2.0, 30.0, 30.0, 30.0, 30.0, 30.0, 30.0])
+
+    per_check = vijay_malik_pro_passes(universe, {})
+
+    assert per_check["npm"].iloc[0] is False
+    assert moat_score(per_check).iloc[0] == 8
+
+
+def test_vijay_malik_pro_passes_tax_payout_range_fails_below_and_above():
+    per_check_low = vijay_malik_pro_passes(_vmp_universe(**{"TaxPayoutRatio Latest (%)": 5.0}), {})
+    assert per_check_low["tax_payout"].iloc[0] is False
+
+    per_check_high = vijay_malik_pro_passes(_vmp_universe(**{"TaxPayoutRatio Latest (%)": 60.0}), {})
+    assert per_check_high["tax_payout"].iloc[0] is False
+
+
+def test_vijay_malik_pro_passes_custom_thresholds():
+    universe = _vmp_universe()
+
+    per_check = vijay_malik_pro_passes(universe, {"market_cap": 5000.0, "tax_payout_min": 30.0})
+
+    assert per_check["market_cap"].iloc[0] is False  # 1000 < 5000
+    assert per_check["tax_payout"].iloc[0] is False  # 27 < 30
 
 
 # --- net_net_passes -----------------------------------------------------------------
@@ -993,7 +1103,8 @@ def make_universe_df(companies: list[dict]) -> pd.DataFrame:
     "Symbol"/"Industry", optionally "ssgr_pct"/"rev_cagr"/"ssgr_passes"/
     "net_cagr"/"debt_equity"/"cfo"/"market_cap"/"ncav"/"ncav_cash_inv_rec"/
     "cash_latest"/"vantage_cfo"/"vantage_int" (the last two as 10-value lists)/
-    "pbit"/"total_liab_ex_equity"/"magic_roc"/"magic_roc_ex_cash", and optionally
+    "pbit"/"total_liab_ex_equity"/"magic_roc"/"magic_roc_ex_cash"/
+    "tax_payout_ratio"/"interest_coverage"/"current_ratio", and optionally
     a list of 10 values for any key in _COMFORTABLE_PASS_VALUES to override that
     row (everything else defaults to a flat comfortable-pass value).
     """
@@ -1022,6 +1133,11 @@ def make_universe_df(companies: list[dict]) -> pd.DataFrame:
             "TotalLiabExEquity Latest (Cr)": company.get("total_liab_ex_equity", 300.0),
             "MagicROC Latest (%)": company.get("magic_roc", 25.0),
             "MagicROCExCash Latest (%)": company.get("magic_roc_ex_cash", 30.0),
+            # Vijay Malik Pro's 3 new scalar checks: comfortably inside their default bars
+            # (Tax Payout 20-35%, Interest Coverage >3x, Current Ratio >1.25x).
+            "TaxPayoutRatio Latest (%)": company.get("tax_payout_ratio", 27.0),
+            "InterestCoverage Latest (x)": company.get("interest_coverage", 5.0),
+            "CurrentRatio Latest (x)": company.get("current_ratio", 1.5),
         }
         vantage_cfo = company.get("vantage_cfo", [500.0] * 10)
         vantage_int = company.get("vantage_int", [50.0] * 10)
@@ -1040,6 +1156,10 @@ def _default_overrides() -> dict:
     overrides = {key: {"use_industry": True, "manual": cfg["default"]} for key, cfg in MOAT_METRIC_CONFIG.items()}
     overrides["ccp"] = {"roce": 15, "growth": 10, "years": 10}
     overrides["vijay_malik"] = {"sales_cagr": 15, "net_cagr": 30, "debt_equity": 100, "cfo": 0, "market_cap": 500}
+    overrides["vijay_malik_pro"] = {
+        "sales_cagr": 15, "npm": 8, "net_cagr": 30, "debt_equity": 50, "cfo": 0, "market_cap": 25,
+        "tax_payout_min": 20, "tax_payout_max": 35, "interest_coverage": 3, "current_ratio": 1.25,
+    }
     overrides["net_net"] = {"min_mcap": 0.0}
     overrides["vantage"] = {"decay": 0.85, "rate": 0.10, "min_threshold": 0.0, "max_threshold": 1.0}
     overrides["magic_formula"] = {"min_market_cap": 0.0}
@@ -1053,7 +1173,7 @@ def test_evaluate_screens_for_company_all_pass():
 
     result = evaluate_screens_for_company(universe, "PASSER", _default_overrides())
 
-    assert len(result) == 20  # SSGR + 7 moats + 4 nalanda + 2 ccp + vijay malik + 2 net-net + vantage + 2 magic formula
+    assert len(result) == 29  # SSGR + 7 moats + 4 nalanda + 2 ccp + vijay malik + 9 vm pro + 2 net-net + vantage + 2 magic formula
     assert (result["Passes"] == True).all()  # noqa: E712
     assert (result["Detail"] == "—").all()
 
@@ -1122,6 +1242,49 @@ def test_evaluate_screens_for_company_vijay_malik_missing_data_is_not_enough():
     vm_row = result[result["Filter"] == "Vijay Malik"].iloc[0]
     assert pd.isna(vm_row["Passes"])
     assert vm_row["Detail"] == "not enough data"
+
+
+def test_evaluate_screens_for_company_vijay_malik_pro_has_9_independent_rows():
+    universe = make_universe_df([
+        {"Symbol": "MOSTLY_GOOD", "Industry": "Ind X", "market_cap": 5.0},
+    ])
+
+    result = evaluate_screens_for_company(universe, "MOSTLY_GOOD", _default_overrides())
+    vmp_rows = result[result["Group"] == "Vijay Malik Pro"]
+
+    assert len(vmp_rows) == 9
+    mcap_row = vmp_rows[vmp_rows["Filter"] == "Market Cap"].iloc[0]
+    assert mcap_row["Passes"] == False  # noqa: E712 (a homogeneous True/False column may be bool dtype, not object)
+    assert "Market Cap" in mcap_row["Detail"]
+    # Every other check should still pass — a scalar failure doesn't cascade
+    # into the other 8 checks, unlike the AND-based Vijay Malik screen.
+    other_rows = vmp_rows[vmp_rows["Filter"] != "Market Cap"]
+    assert (other_rows["Passes"] == True).all()  # noqa: E712
+
+
+def test_evaluate_screens_for_company_vijay_malik_pro_range_check_names_the_bound():
+    universe = make_universe_df([
+        {"Symbol": "LOWTAX", "Industry": "Ind X", "tax_payout_ratio": 5.0},
+    ])
+
+    result = evaluate_screens_for_company(universe, "LOWTAX", _default_overrides())
+
+    tax_row = result[result["Filter"] == "Tax Payout Ratio"].iloc[0]
+    assert tax_row["Passes"] == False  # noqa: E712 (a homogeneous True/False column may be bool dtype, not object)
+    assert "not above" in tax_row["Detail"]
+
+
+def test_evaluate_screens_for_company_vijay_malik_pro_consistency_check_reports_failing_years():
+    universe = make_universe_df([
+        {"Symbol": "BADYEAR", "Industry": "Ind X",
+         "NPM": [30.0, 30.0, 30.0, 2.0, 30.0, 30.0, 30.0, 30.0, 30.0, 30.0]},
+    ])
+
+    result = evaluate_screens_for_company(universe, "BADYEAR", _default_overrides())
+
+    npm_row = result[result["Filter"] == "NPM (every year)"].iloc[0]
+    assert npm_row["Passes"] == False  # noqa: E712 (a homogeneous True/False column may be bool dtype, not object)
+    assert "fails in 1/10 year(s)" in npm_row["Detail"]
 
 
 def test_evaluate_screens_for_company_net_net_fails_when_mcap_above_ncav():
@@ -1226,6 +1389,6 @@ def test_evaluate_screens_for_company_symbol_not_in_universe():
 
     result = evaluate_screens_for_company(universe, "NOT_THERE", _default_overrides())
 
-    assert len(result) == 20
+    assert len(result) == 29
     assert result["Passes"].isna().all()
     assert (result["Detail"] == "not in Screens cache — click Refresh on the Screens page").all()

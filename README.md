@@ -4,13 +4,14 @@ A Streamlit app for exploring the fundamentals of a universe of stocks (quarterl
 
 ## Features
 
-- **Data Explorer** — search companies by symbol or industry, then drill into one company's quarterly financials, annual income statement, and balance sheet, plus derived metrics: OP, OPM, PBIT, PBT, NPM, EPS, TTM figures, CAGR (1/3/5/10 years and 1/3/5/10 quarters), SSGR, capex/debt/equity ratios, and ROCE.
+- **Data Explorer** — search companies by symbol or industry, then drill into one company's quarterly financials, annual income statement, and balance sheet, plus derived metrics: OP, OPM, PBIT, PBT, NPM, EPS, TTM figures, CAGR (1/3/5/10 years and 1/3/5/10 quarters), SSGR, capex/debt/equity ratios, and ROCE. A **Trends** section charts Revenue/OP, margins, returns (ROE/ROCE), EPS, and leverage over the last 10 fiscal years.
 - **Screens** — run the same metrics across the entire universe of companies:
   - **SSGR** — Self-Sustainable Growth Rate vs. 10-year revenue CAGR (did the company grow organically, without needing external capital?).
   - **Moats** — 7 quality screens (Operating Margin, Net Margin, Interest/Operating Profit, Capex/Revenue, Capex/Net Income, Liabilities/Equity, ROE), each checked for consistency over the last 10 fiscal years, with a combined 0–7 score and ranking.
   - **Nalanda's F** — 4 ROCE-based filters (ROCE and ROCE excluding excess cash and investments, each checked as a 10-year median and as an every-year-of-10 bar), against a manual threshold.
   - **CCP (Coffee Can Portfolio)** — ROCE (regular and excluding excess cash) AND revenue growth, both above a bar every year for a configurable number of years. Two lists, fixed absolute thresholds.
   - **Vijay Malik** — a 5-parameter checklist: Sales CAGR, Net Profit CAGR (both 10-year), Debt/Equity and CFO (latest year), and Market Cap — all 5 must pass.
+  - **Vijay Malik Pro** — a more detailed, 9-parameter version scored 0–9 (one point per check cleared) and ranked, instead of requiring every check to pass: Sales CAGR, Net Profit CAGR (10Y), NPM above a bar every year, CFO positive every year, Debt/Equity, Market Cap, Tax Payout Ratio (a 20–35% range), Interest Coverage, and Current Ratio.
   - **Net-Net** — Benjamin Graham's screen: Market Cap below Net Current Asset Value (current assets minus total liabilities excluding equity). Two lists (one using all current assets, one using only Cash + Inventory + Receivables) sharing a configurable minimum Market Cap floor — sorted by biggest discount to NCAV first.
   - **Vantage** — Sanjay Bakshi's banker's-valuation screen: a decay-weighted 10-year average of CFO and Interest gives a Cashflow, a third of which (Interest Serviceable) divided by a configurable lending rate gives the Loan a banker would extend; adding Cash gives Total Value. Passes when Market Cap / Total Value falls in a configurable range (default 0 to 1) — the lower bound rules out companies whose Loan capacity has gone negative (Loan swamps Cash) from ever looking "cheap."
   - **Magic Formula** — Joel Greenblatt's rank-and-sum screen: companies are ranked by Earnings Yield (PBIT / Enterprise Value) and by Return on Capital (PBIT / (Net Block + Working Capital)), the two ranks are added together, and that sum is ranked again to surface the top 10. Two lists (Working Capital with vs. without cash) sharing a configurable minimum Market Cap floor, applied before ranking.
@@ -126,7 +127,7 @@ app.py                    # multipage entrypoint (navigation only)
 data_loader.py             # all data loading, reshaping, and derived-metric/screen logic
 pages/
   data_explorer.py          # per-company exploration page
-  screens.py                 # universe-wide screens page (SSGR, Moats, Nalanda's F, CCP, Vijay Malik, Net-Net, Vantage, Magic Formula)
+  screens.py                 # universe-wide screens page (SSGR, Moats, Nalanda's F, CCP, Vijay Malik, Vijay Malik Pro, Net-Net, Vantage, Magic Formula)
 tests/
   test_data_loader.py        # unit + integration tests, using hand-built synthetic sheets
 requirements.txt

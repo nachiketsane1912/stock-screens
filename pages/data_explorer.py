@@ -4,6 +4,8 @@ import streamlit as st
 from data_loader import (
     MOAT_METRIC_CONFIG,
     VIJAY_MALIK_CHECKS,
+    VIJAY_MALIK_PRO_CHECKS,
+    build_trend_frame,
     company_vantage_metrics,
     evaluate_screens_for_company,
     get_company_view,
@@ -12,6 +14,14 @@ from data_loader import (
     macro_table,
     merge_market_data,
 )
+
+TREND_CHARTS = [
+    ("Revenue & Operating Profit (₹ Cr)", ["Rev", "OP"]),
+    ("Margins (%)", ["OPM", "NPM"]),
+    ("Returns (%)", ["ROE", "ROCE", "ROCEExCash"]),
+    ("EPS (₹)", ["EPS"]),
+    ("Leverage (%)", ["LiabEquity", "DebtEquity"]),
+]
 
 st.title("Stock Fundamentals Explorer")
 
@@ -82,6 +92,18 @@ if symbol:
             check["key"]: st.session_state.get(f"vm_{check['key']}_saved", check["default"])
             for check in VIJAY_MALIK_CHECKS
         }
+        overrides["vijay_malik_pro"] = {}
+        for check in VIJAY_MALIK_PRO_CHECKS:
+            key = check["key"]
+            if check["type"] == "range":
+                overrides["vijay_malik_pro"][f"{key}_min"] = st.session_state.get(
+                    f"vmpro_{key}_min_saved", check["default_min"]
+                )
+                overrides["vijay_malik_pro"][f"{key}_max"] = st.session_state.get(
+                    f"vmpro_{key}_max_saved", check["default_max"]
+                )
+            else:
+                overrides["vijay_malik_pro"][key] = st.session_state.get(f"vmpro_{key}_saved", check["default"])
         overrides["net_net"] = {
             "min_mcap": st.session_state.get("net_net_min_mcap_saved", 0.0),
         }
@@ -92,11 +114,22 @@ if symbol:
             "max_threshold": vantage_max_threshold,
         }
         overrides["magic_formula"] = {
-            "min_market_cap": st.session_state.get("magic_formula_min_market_cap_saved", 0.0),
+            "min_market_cap": st.session_state.get("magic_formula_min_market_cap_saved", 5000.0),
         }
         st.dataframe(
             evaluate_screens_for_company(universe, symbol, overrides), use_container_width=True, hide_index=True
         )
+
+    st.markdown("**Trends**")
+    trend_cols = st.columns(2)
+    for i, (title, rows) in enumerate(TREND_CHARTS):
+        with trend_cols[i % 2]:
+            st.caption(title)
+            frame = build_trend_frame(view["income_statement"], rows)
+            if frame.dropna(how="all").empty:
+                st.caption("Not enough history")
+            else:
+                st.line_chart(frame)
 
     st.markdown("**Market**")
     market = view["market"]

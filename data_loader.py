@@ -272,8 +272,8 @@ def add_ssgr(is_table: pd.DataFrame, bs_table: pd.DataFrame) -> pd.DataFrame:
 
 def add_capex_and_ratios(is_table: pd.DataFrame, bs_table: pd.DataFrame) -> pd.DataFrame:
     """Add NetWorth, Capex, LowCapex, LowDebt, CapexNI, LiabEquity, ROE,
-    DebtEquity and TotalLiabExEquity rows to an IS metric table (annual only,
-    like add_ssgr).
+    DebtEquity, TotalLiabExEquity, TaxPayoutRatio and InterestCoverage rows to
+    an IS metric table (annual only, like add_ssgr).
 
     NetWorth = Eq + Res (Equity Capital + Reserves — the standard "Equity" in
                Debt/Equity and ROE ratios)
@@ -289,6 +289,11 @@ def add_capex_and_ratios(is_table: pd.DataFrame, bs_table: pd.DataFrame) -> pd.D
         Borr + OL — this is the textbook "Debt/Equity", used by the Vijay Malik screen)
     TotalLiabExEquity = Borr + OL   (the same quantity as LiabEquity's numerator,
         exposed directly — used as part of Enterprise Value in the Magic Formula screen)
+    TaxPayoutRatio = (PBT - Net) / PBT * 100   (the workbook has no Tax line;
+        PBT - Net *is* tax paid — this is Vijay Malik's own published "tax
+        payout ratio", checked against the ~20-35% normal corporate-tax band)
+    InterestCoverage = PBIT / Int   (PBIT is EBIT under a different name —
+        see add_roce — making this the textbook interest-coverage ratio)
     """
     if is_table.empty or bs_table.empty:
         return is_table
@@ -297,6 +302,8 @@ def add_capex_and_ratios(is_table: pd.DataFrame, bs_table: pd.DataFrame) -> pd.D
     net = _numeric_row(is_table, "Net")
     interest = _numeric_row(is_table, "Int")
     op = _numeric_row(is_table, "OP")
+    pbt = _numeric_row(is_table, "PBT")
+    pbit = _numeric_row(is_table, "PBIT")
 
     nb_wip = _numeric_row(bs_table, "NB") + _numeric_row(bs_table, "WIP")
     prior_nb_wip = nb_wip.shift(-1)  # BS columns are most-recent-first; shift(-1) pulls in the prior year
@@ -316,13 +323,16 @@ def add_capex_and_ratios(is_table: pd.DataFrame, bs_table: pd.DataFrame) -> pd.D
     is_table.loc["ROE"] = (_safe_divide(net, net_worth) * 100).round(2)
     is_table.loc["DebtEquity"] = (_safe_divide(borr, net_worth) * 100).round(2)
     is_table.loc["TotalLiabExEquity"] = borr_ol.round(2)
+    is_table.loc["TaxPayoutRatio"] = (_safe_divide(pbt - net, pbt) * 100).round(2)
+    is_table.loc["InterestCoverage"] = _safe_divide(pbit, interest).round(2)
 
     return is_table
 
 
 def add_roce(is_table: pd.DataFrame, bs_table: pd.DataFrame) -> pd.DataFrame:
     """Add WC, CapitalEmployed, ROCE, CapitalEmployedExCash, ROCEExCash, NCAV,
-    NCAVCashInvRec, MagicROC and MagicROCExCash rows to an IS table (annual only).
+    NCAVCashInvRec, MagicROC, MagicROCExCash and CurrentRatio rows to an IS
+    table (annual only).
 
     WC = OA - OL   (the workbook has no granular Current Assets/Liabilities
          split, so this reuses the same OA/OL aggregates as add_bs_totals/
@@ -345,6 +355,8 @@ def add_roce(is_table: pd.DataFrame, bs_table: pd.DataFrame) -> pd.DataFrame:
     MagicROCExCash = PBIT / (NB + WC - Cash) * 100   (excludes only Cash —
         Invest was never part of this capital base to begin with, unlike
         ROCEExCash's CapitalEmployed, so there's nothing else to exclude)
+    CurrentRatio = OA / OL   (reuses the same OA-as-Current-Assets,
+        OL-as-Current-Liabilities proxy already established for WC/NCAV)
     """
     if is_table.empty or bs_table.empty:
         return is_table
@@ -374,6 +386,7 @@ def add_roce(is_table: pd.DataFrame, bs_table: pd.DataFrame) -> pd.DataFrame:
     is_table.loc["NCAVCashInvRec"] = ((cash + inv + rec) - (borr + ol)).round(2)
     is_table.loc["MagicROC"] = (_safe_divide(pbit, nb + wc) * 100).round(2)
     is_table.loc["MagicROCExCash"] = (_safe_divide(pbit, nb + wc - cash) * 100).round(2)
+    is_table.loc["CurrentRatio"] = _safe_divide(oa, ol).round(2)
 
     return is_table
 
@@ -432,6 +445,18 @@ def build_cagr_table(
             result.loc[metric, col] = _cagr_pct(latest, base, w / periods_per_year)
 
     return result
+
+
+def build_trend_frame(table: pd.DataFrame, rows: list[str]) -> pd.DataFrame:
+    """Transpose selected rows of an annual metric table (IS/BS) into a
+    chronological (oldest-first) period x metric frame, suitable for a line
+    chart. Drops the TTM column (not a fiscal year) if present; a row not in
+    `table` comes back as an all-NaN column rather than raising.
+    """
+    annual_cols = [c for c in table.columns if c != "TTM"]
+    chronological = list(reversed(annual_cols))
+    data = {row: _numeric_row(table, row).reindex(chronological) for row in rows}
+    return pd.DataFrame(data, index=chronological)
 
 
 def add_bs_totals(table: pd.DataFrame) -> pd.DataFrame:
@@ -556,11 +581,13 @@ def build_universe_cache(
     (Cr)`, plus `Int Y1 (Cr)`..`Int Y10 (Cr)` and `CFO Y1 (Cr)`..`CFO Y10
     (Cr)` — a 10-year raw series, not a precomputed average, since Vantage's
     year-weighting is user-adjustable and must be recomputable instantly on
-    every rerun), and the Magic Formula screen (`PBIT Latest (Cr)`,
+    every rerun), the Magic Formula screen (`PBIT Latest (Cr)`,
     `TotalLiabExEquity Latest (Cr)`, `MagicROC Latest (%)`, `MagicROCExCash
-    Latest (%)`) — all are the latest completed fiscal year's value or a raw
-    10-year series, not a fixed consistency bar, since these screens check a
-    balance-sheet snapshot or a configurable weighted average/ranking.
+    Latest (%)`), and the Vijay Malik Pro screen (`TaxPayoutRatio Latest (%)`,
+    `InterestCoverage Latest (x)`, `CurrentRatio Latest (x)`) — all are the
+    latest completed fiscal year's value or a raw 10-year series, not a fixed
+    consistency bar, since these screens check a balance-sheet snapshot or a
+    configurable weighted average/ranking.
     Price/P·E/Market Cap are *not* here — `merge_market_data()` reads those
     straight from the `Market` sheet on every page load instead, since Price
     changes far more often than fundamentals do.
@@ -602,6 +629,12 @@ def build_universe_cache(
             if "MagicROC" in income_statement.index and annual_cols else float("nan"),
             "MagicROCExCash Latest (%)": income_statement.loc["MagicROCExCash", annual_cols[0]]
             if "MagicROCExCash" in income_statement.index and annual_cols else float("nan"),
+            "TaxPayoutRatio Latest (%)": income_statement.loc["TaxPayoutRatio", annual_cols[0]]
+            if "TaxPayoutRatio" in income_statement.index and annual_cols else float("nan"),
+            "InterestCoverage Latest (x)": income_statement.loc["InterestCoverage", annual_cols[0]]
+            if "InterestCoverage" in income_statement.index and annual_cols else float("nan"),
+            "CurrentRatio Latest (x)": income_statement.loc["CurrentRatio", annual_cols[0]]
+            if "CurrentRatio" in income_statement.index and annual_cols else float("nan"),
         }
         for is_row in rows_needed:
             row_values = _numeric_row(income_statement, is_row)
@@ -690,6 +723,7 @@ def metric_moat_passes(
     direction: str = "higher",
     consistency: str = "all_years",
     years: int = 10,
+    unit: str = "%",
 ) -> pd.Series:
     """Tri-state (True/False/pd.NA) verdict for one screen reading IS row `row`.
 
@@ -702,9 +736,12 @@ def metric_moat_passes(
     SSGR screen's None-for-insufficient-data convention — a median still needs
     the full window to mean that. `years` defaults to 10 (every screen so far
     uses the full window the universe cache stores; CCP is the first to let
-    the user shrink it).
+    the user shrink it). `unit` selects which cached `Y1..Y10` column family
+    to read (`"{row} Y{y} ({unit})"`) — every screen so far uses the default
+    `"%"`; Vijay Malik Pro's "CFO every year positive" check is the first to
+    pass `unit="Cr"`, reusing the already-cached `CFO Y1..Y10 (Cr)` columns.
     """
-    cols = [f"{row} Y{y} (%)" for y in range(1, years + 1)]
+    cols = [f"{row} Y{y} ({unit})" for y in range(1, years + 1)]
     has_full_history = universe[cols].notna().all(axis=1)
     if consistency == "median":
         value = universe[cols].median(axis=1)
@@ -760,6 +797,59 @@ def vijay_malik_passes(universe: pd.DataFrame, thresholds: dict) -> tuple[dict[s
     }
     combined = reduce(and_tri_state, per_check.values())
     return per_check, combined
+
+
+# Vijay Malik Pro: a more detailed, 9-check version of the checklist above,
+# scored (0-9, one point per check cleared via moat_score) rather than
+# AND-ed into a single pass/fail — same shape as the Moats tab's 7 distinct
+# traits. Unlike VIJAY_MALIK_CHECKS, this mixes three kinds of check:
+# "scalar" (a single already-computed column vs. a fixed threshold, same as
+# VIJAY_MALIK_CHECKS), "consistency" (every one of the last 10 years must
+# clear a bar, via metric_moat_passes), and "range" (two thresholds, both
+# sides must clear, via and_tri_state — same shape as Vantage's Multiple
+# range). "unit" is display-only for scalar/range checks; for "consistency"
+# checks it also selects which cached Y1..Y10 column family to read.
+VIJAY_MALIK_PRO_CHECKS = [
+    {"key": "sales_cagr", "type": "scalar", "label": "Sales CAGR (10Y)", "column": "Rev 10Y CAGR (%)", "direction": "higher", "unit": "%", "default": 15.0},
+    {"key": "npm", "type": "consistency", "label": "NPM (every year)", "row": "NPM", "direction": "higher", "unit": "%", "default": 8.0},
+    {"key": "net_cagr", "type": "scalar", "label": "Net Profit CAGR (10Y)", "column": "Net 10Y CAGR (%)", "direction": "higher", "unit": "%", "default": 30.0},
+    {"key": "debt_equity", "type": "scalar", "label": "Debt/Equity", "column": "DebtEquity Latest (%)", "direction": "lower", "unit": "%", "default": 50.0},
+    {"key": "cfo", "type": "consistency", "label": "CFO (every year positive)", "row": "CFO", "direction": "higher", "unit": "Cr", "default": 0.0},
+    {"key": "market_cap", "type": "scalar", "label": "Market Cap", "column": "Market Cap (Cr)", "direction": "higher", "unit": " Cr", "default": 25.0},
+    {"key": "tax_payout", "type": "range", "label": "Tax Payout Ratio", "column": "TaxPayoutRatio Latest (%)", "unit": "%", "default_min": 20.0, "default_max": 35.0},
+    {"key": "interest_coverage", "type": "scalar", "label": "Interest Coverage", "column": "InterestCoverage Latest (x)", "direction": "higher", "unit": "x", "default": 3.0},
+    {"key": "current_ratio", "type": "scalar", "label": "Current Ratio", "column": "CurrentRatio Latest (x)", "direction": "higher", "unit": "x", "default": 1.25},
+]
+
+
+def vijay_malik_pro_passes(universe: pd.DataFrame, thresholds: dict) -> dict[str, pd.Series]:
+    """Tri-state pass/fail for each of the 9 VIJAY_MALIK_PRO_CHECKS
+    (`thresholds` keyed by each check's "key" — a "range" check reads
+    "{key}_min"/"{key}_max" instead — falling back to the check's own
+    default(s)). Unlike vijay_malik_passes, does *not* AND these into one
+    combined verdict — callers score them with moat_score() instead, and
+    evaluate_screens_for_company shows each check as its own Filters row.
+    """
+    per_check: dict[str, pd.Series] = {}
+    for check in VIJAY_MALIK_PRO_CHECKS:
+        key = check["key"]
+        if check["type"] == "scalar":
+            values = pd.to_numeric(universe[check["column"]], errors="coerce")
+            per_check[key] = scalar_metric_passes(values, thresholds.get(key, check["default"]), check["direction"])
+        elif check["type"] == "consistency":
+            threshold = thresholds.get(key, check["default"])
+            threshold_series = pd.Series(threshold, index=universe.index)
+            per_check[key] = metric_moat_passes(
+                universe, check["row"], threshold_series, check["direction"], "all_years", 10, check["unit"]
+            )
+        else:  # "range"
+            values = pd.to_numeric(universe[check["column"]], errors="coerce")
+            min_threshold = thresholds.get(f"{key}_min", check["default_min"])
+            max_threshold = thresholds.get(f"{key}_max", check["default_max"])
+            above_min = scalar_metric_passes(values, min_threshold, "higher")
+            below_max = scalar_metric_passes(values, max_threshold, "lower")
+            per_check[key] = and_tri_state(above_min, below_max)
+    return per_check
 
 
 def net_net_passes(universe: pd.DataFrame, ncav_column: str) -> pd.Series:
@@ -985,22 +1075,28 @@ def failure_detail(values: pd.Series, threshold: float, direction: str, consiste
 
 def evaluate_screens_for_company(universe: pd.DataFrame, symbol: str, overrides: dict) -> pd.DataFrame:
     """Evaluate every screen (SSGR, all MOAT_METRIC_CONFIG entries, the 2 CCP
-    lists, Vijay Malik, the 2 Net-Net lists, Vantage, and the 2 Magic Formula
-    rankings) for one company, using the same formulas `pages/screens.py`
-    uses for the whole universe. `overrides` (resolved by the caller from
-    st.session_state, kept out of this function to stay UI-free):
-    {config_key: {"use_industry": bool, "manual": float}} for every
-    MOAT_METRIC_CONFIG key, plus "ccp": {"roce": float, "growth": float,
-    "years": int}, "vijay_malik": {check["key"]: float, ...} for each of
-    VIJAY_MALIK_CHECKS, "net_net": {"min_mcap": float} (the shared Market Cap
-    floor both Net-Net lists apply on top of their own Mcap<NCAV comparison —
-    mirrors how CCP's two ROCE variants share one revenue-growth check),
-    "vantage": {"decay": float, "rate": float, "min_threshold": float,
-    "max_threshold": float}, and "magic_formula": {"min_market_cap": float}
-    (the pre-ranking eligibility floor shared by both Magic Formula rankings).
-    Returns one row per screen: Filter, Group, Passes (True/False/pd.NA),
-    Detail ("—" if passing, "not enough history"/"not enough data" if NA,
-    else a failure explanation).
+    lists, Vijay Malik, all 9 Vijay Malik Pro checks, the 2 Net-Net lists,
+    Vantage, and the 2 Magic Formula rankings) for one company, using the same
+    formulas `pages/screens.py` uses for the whole universe. `overrides`
+    (resolved by the caller from st.session_state, kept out of this function
+    to stay UI-free): {config_key: {"use_industry": bool, "manual": float}}
+    for every MOAT_METRIC_CONFIG key, plus "ccp": {"roce": float, "growth":
+    float, "years": int}, "vijay_malik": {check["key"]: float, ...} for each
+    of VIJAY_MALIK_CHECKS, "vijay_malik_pro": {check["key"]: float, ...} for
+    each of VIJAY_MALIK_PRO_CHECKS (plus "tax_payout_min"/"tax_payout_max"
+    for its one range check), "net_net": {"min_mcap": float} (the shared
+    Market Cap floor both Net-Net lists apply on top of their own
+    Mcap<NCAV comparison — mirrors how CCP's two ROCE variants share one
+    revenue-growth check), "vantage": {"decay": float, "rate": float,
+    "min_threshold": float, "max_threshold": float}, and "magic_formula":
+    {"min_market_cap": float} (the pre-ranking eligibility floor shared by
+    both Magic Formula rankings). Returns one row per screen — Vijay Malik
+    Pro's 9 checks each get their own row (not AND-ed into one, unlike Vijay
+    Malik/CCP — same "each trait is its own row" convention as the Moats
+    checks; the combined 0-9 Score is a Screens-page ranking concept only,
+    never shown here): Filter, Group, Passes (True/False/pd.NA), Detail
+    ("—" if passing, "not enough history"/"not enough data" if NA, else a
+    failure explanation).
     """
     columns = ["Filter", "Group", "Passes", "Detail"]
     match = universe.loc[universe["Symbol"] == symbol]
@@ -1010,6 +1106,7 @@ def evaluate_screens_for_company(universe: pd.DataFrame, symbol: str, overrides:
             for label, group in [("SSGR", "SSGR")]
             + [(cfg["label"], "Moats" if cfg["group"] == "moats" else "Nalanda's F") for cfg in MOAT_METRIC_CONFIG.values()]
             + [("CCP – Regular ROCE", "CCP"), ("CCP – Nalanda's F", "CCP"), ("Vijay Malik", "Vijay Malik")]
+            + [(cfg["label"], "Vijay Malik Pro") for cfg in VIJAY_MALIK_PRO_CHECKS]
             + [("Net-Net – Full Current Assets", "Net-Net"), ("Net-Net – Cash+Inv+Rec", "Net-Net")]
             + [("Vantage", "Vantage")]
             + [("Magic Formula – Plain WC", "Magic Formula"), ("Magic Formula – Ex Cash", "Magic Formula")]
@@ -1107,6 +1204,41 @@ def evaluate_screens_for_company(universe: pd.DataFrame, symbol: str, overrides:
 
     rows.append(("Vijay Malik", "Vijay Malik", vm_passes, vm_detail))
 
+    vmp_thresholds = overrides.get("vijay_malik_pro", {})
+    vmp_per_check = vijay_malik_pro_passes(universe, vmp_thresholds)
+    for check in VIJAY_MALIK_PRO_CHECKS:
+        key = check["key"]
+        passes = vmp_per_check[key].loc[idx]
+
+        if pd.isna(passes):
+            detail = "not enough history" if check["type"] == "consistency" else "not enough data"
+        elif passes:
+            detail = "—"
+        elif check["type"] == "range":
+            value = pd.to_numeric(pd.Series([urow[check["column"]]]), errors="coerce").iloc[0]
+            min_threshold = vmp_thresholds.get(f"{key}_min", check["default_min"])
+            max_threshold = vmp_thresholds.get(f"{key}_max", check["default_max"])
+            if value < min_threshold:
+                detail = f"{check['label']} {value:.2f}{check['unit']} is not above {min_threshold:.2f}{check['unit']}"
+            else:
+                detail = f"{check['label']} {value:.2f}{check['unit']} is not below {max_threshold:.2f}{check['unit']}"
+        elif check["type"] == "consistency":
+            threshold = vmp_thresholds.get(key, check["default"])
+            values = pd.to_numeric(
+                urow[[f"{check['row']} Y{y} ({check['unit']})" for y in range(1, 11)]], errors="coerce"
+            )
+            detail = failure_detail(values, threshold, check["direction"], "all_years")
+        else:  # scalar
+            value = pd.to_numeric(pd.Series([urow[check["column"]]]), errors="coerce").iloc[0]
+            threshold = vmp_thresholds.get(key, check["default"])
+            cmp_word = "above" if check["direction"] == "higher" else "below"
+            detail = (
+                f"{check['label']} {value:.2f}{check['unit']} is not {cmp_word} "
+                f"the threshold {threshold:.2f}{check['unit']}"
+            )
+
+        rows.append((check["label"], "Vijay Malik Pro", passes, detail))
+
     net_net_overrides = overrides.get("net_net", {})
     min_mcap = net_net_overrides.get("min_mcap", 0.0)
     mcap_series = pd.to_numeric(universe["Market Cap (Cr)"], errors="coerce")
@@ -1170,7 +1302,7 @@ def evaluate_screens_for_company(universe: pd.DataFrame, symbol: str, overrides:
     rows.append(("Vantage", "Vantage", vantage_passes, vantage_detail))
 
     magic_formula_overrides = overrides.get("magic_formula", {})
-    min_market_cap = magic_formula_overrides.get("min_market_cap", 0.0)
+    min_market_cap = magic_formula_overrides.get("min_market_cap", 5000.0)
 
     for label, roc_column in [
         ("Magic Formula – Plain WC", "MagicROC Latest (%)"),
