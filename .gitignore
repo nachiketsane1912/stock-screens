@@ -1,5 +1,8 @@
-# Personal financial data — not for the repo (see CLAUDE.md)
+# Personal financial data — not for the repo
 Raw data.xlsx
+
+# Internal architecture notes — kept locally, not published to GitHub
+CLAUDE.md
 
 # Generated screen caches (regenerate via the Refresh button on the Screens page)
 universe_cache.csv
