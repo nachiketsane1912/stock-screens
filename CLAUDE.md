@@ -20,7 +20,7 @@ This is a small Streamlit app for exploring fundamentals of multiple stocks pull
 - **`data_loader.py`** — all data access and reshaping. No Streamlit UI logic except the `@st.cache_data` decorator on `load_raw`.
 - **`app.py`** — the multipage entrypoint only: calls `st.set_page_config` then `st.navigation([...]).run()`. Holds no UI of its own.
 - **`pages/data_explorer.py`** — per-company exploration (search, symbol picker, quarterly/IS/BS/CAGR tables, a **Filters** section showing every screen's verdict for the selected company). Reads `st.session_state["jump_to_symbol"]` (set by the Screens page) to pre-select a symbol for drill-through, via a `key="data_explorer_symbol"` selectbox.
-- **`pages/screens.py`** — runs screens across the whole universe of companies (SSGR, Moats, Nalanda's F, CCP, Vijay Malik, Net-Net tabs) and lists who passes each.
+- **`pages/screens.py`** — runs screens across the whole universe of companies (SSGR, Moats, Nalanda's F, CCP, Vijay Malik, Net-Net, Vantage tabs) and lists who passes each.
 
 ### Pages / navigation
 
@@ -194,9 +194,32 @@ The 6th tab, **Net-Net**, is structured like CCP: **two lists sharing one second
 - A shared **Market Cap floor** (`st.number_input`, default `0.0` — off) filters out companies too small/illiquid to matter, *not* a ceiling — confirmed with the user, since true net-nets are almost always small caps and an unfiltered screen can otherwise surface untradeable micro-caps. Applied via `scalar_metric_passes(mcap, min_mcap, "higher")`, AND-ed with each list's `net_net_passes()` result via `and_tri_state` — exactly how CCP ANDs its two ROCE variants with one shared revenue-growth check. Shadow-copied to `"net_net_min_mcap_saved"`, same cross-page-sync fix as every other screen.
 - `render_net_net_tab()` loops over the two `(label, ncav_column)` pairs (mirroring `render_ccp_tab`'s loop over its two `(label, roce_row)` pairs), showing only the passing companies per list, sorted by `Discount to NCAV (%)` (`(NCAV − Mcap) / NCAV * 100`, computed for display only, not cached) descending — biggest bargains first.
 
+### Vantage tab: Sanjay Bakshi's banker's-valuation analysis
+
+The 7th tab, **Vantage**, values a company the way a banker sizing up collateral would, then compares that valuation to the market price:
+
+```
+WA_CFO / WA_Interest = decay-weighted average of CFO / Int over the last 10 fiscal years (Y1 = latest,
+                        weighs most; weight for the i-th year back = decay**(i-1))
+Cashflow             = WA_CFO - WA_Interest
+InterestServiceable  = Cashflow / 3                      (fixed divisor — not user-configurable, not asked)
+Loan                 = InterestServiceable / lending_rate (rate as a decimal, e.g. 0.10 for 10%)
+TotalValue           = Loan + Cash (latest year)
+Multiple             = Market Cap (Cr) / TotalValue
+Passes               = min_threshold < Multiple < max_threshold  (default 0.0 < Multiple < 1.0)
+```
+
+- **`weighted_average_by_year(universe, row_prefix, unit, decay, years=10)`** — generic decay-weighted average of `"{row_prefix} Y1 ({unit})"`..`"{row_prefix} Y{years} ({unit})"`; `NaN` if any of the `years` years is missing (same "needs the full window" convention as `metric_moat_passes`). `decay` is the single UI-configurable "recency weighting" control — deliberately one slider rather than 10 separate per-year weights, keeping this screen's UI in line with every other screen's couple-of-sliders footprint.
+- **`build_universe_cache()`** now also caches `"Int Y1 (Cr)"`..`"Int Y10 (Cr)"` (from `income_statement`), `"CFO Y1 (Cr)"`..`"CFO Y10 (Cr)"` (from `balance_sheet` — not previously cached as a 10-year series, only `CFO Latest (Cr)` existed for Vijay Malik), and `"Cash Latest (Cr)"`. These are raw building blocks, not a precomputed average, because `decay` is user-adjustable — the pass/fail must recompute instantly on every rerun, not require a 53s Refresh every time the slider moves.
+- **`vantage_metrics(universe, decay, rate, years=10)`** runs the whole pipeline above universe-wide in one shot (used by both `render_vantage_tab()` and `evaluate_screens_for_company()`, avoiding the duplicated-computation pattern CCP/Vijay Malik accept). `Multiple` is `_safe_divide(Market Cap (Cr), Total Value (Cr))` — deliberately **not masking a negative `TotalValue`**: a negative `Multiple` is exactly the "Loan swamps Cash" signal the pass condition's lower bound (`Multiple > 0`) is designed to catch, so it must survive to the comparison rather than becoming `NaN`.
+- **The pass condition is a range, not a ceiling** — `min_threshold < Multiple < max_threshold`, both configurable (`st.number_input`, defaults `0.0`/`1.0`), computed as `and_tri_state(scalar_metric_passes(multiple, min_threshold, "higher"), scalar_metric_passes(multiple, max_threshold, "lower"))`. The lower bound exists specifically to rule out a negative `TotalValue` (a company whose debt-servicing capacity is so poor that `Loan` swamps `Cash`) ever numerically satisfying "Multiple < 1" and masquerading as cheap.
+- **`company_vantage_metrics(income_statement, balance_sheet, price, decay, rate, years=10)`** is the per-company equivalent for Data Explorer — builds a one-row, universe-cache-shaped frame from that company's own tables and feeds it through `vantage_metrics()` itself (no duplicated math), then adds a `NOS`-based `value_per_share` and `price`-based `multiple` for display. This per-share `Multiple` and the universe-wide `Market Cap / TotalValue` `Multiple` are algebraically identical only if both sides use the same share count — the universe screen skips share counts entirely (simpler, no lag), while the per-company view uses the company's own `NOS` for a transparent, inspectable per-share breakdown; small divergences between the two are expected, same as the existing `NOS`-vs-vendor-implied-shares lag already accepted elsewhere in this app.
+- **Assumption**: "Cash" is the `Cash` BS row alone, not `Cash + Invest` — same literal reading used everywhere else in this app.
+- Shown on Data Explorer as a small **"Vantage"** metrics block (WA CFO, WA Interest, Loan, Total Value, Cashflow, Interest Serviceable, Value/Share, Multiple) — the one screen whose building blocks aren't otherwise visible anywhere else on the page, unlike e.g. Vijay Malik's checks which reuse existing IS/BS rows.
+
 ### Data Explorer's Filters section: one company vs. every screen
 
-`pages/data_explorer.py` shows a **Filters** table (right after the company header, before the detailed financial tables) with a row for every screen across the whole app — SSGR + the 7 Moats + the 4 Nalanda's F filters + the 2 CCP lists + Vijay Malik + the 2 Net-Net lists (17 rows) — giving that one company's verdict on each, and *why* it failed when it did.
+`pages/data_explorer.py` shows a **Filters** table (right after the company header, before the detailed financial tables) with a row for every screen across the whole app — SSGR + the 7 Moats + the 4 Nalanda's F filters + the 2 CCP lists + Vijay Malik + the 2 Net-Net lists + Vantage (18 rows) — giving that one company's verdict on each, and *why* it failed when it did.
 
 - **`data_loader.py`'s `evaluate_screens_for_company(universe, symbol, overrides)`** does the actual work (kept there, not in the page, so it's covered by the test suite): looks up the one row for `symbol` in the universe cache and re-runs the exact same `industry_metric_thresholds()`/`metric_moat_passes()`/`and_tri_state()` calls `pages/screens.py` uses for the whole universe, just for that one row. `overrides` (a plain dict the page resolves from `st.session_state`, keeping this function itself UI-free) carries each screen's current threshold settings.
 - **`failure_detail(values, threshold, direction, consistency)`** — new, pure/testable — turns a definite `False` verdict into a specific explanation: for `"all_years"`, the exact failing years and their values (e.g. `"fails in 2/10 year(s): Y3 (12.40%), Y7 (9.80%)"`); for `"median"`, the median vs. the threshold. For a CCP row (an AND of two sub-checks), `evaluate_screens_for_company` calls this once per failing sub-check and prefixes each with which one it is (`"ROCE: ..."` / `"Revenue growth: ..."`), so a CCP failure never just says "fails" without saying which side caused it.

@@ -539,10 +539,14 @@ def build_universe_cache(
     most recent completed fiscal years (Y1 = latest completed FY), NaN where
     fewer than 10 years exist. Also includes single-scalar columns for the
     Vijay Malik screen (`Net 10Y CAGR (%)`, `DebtEquity Latest (%)`, `CFO
-    Latest (Cr)`) and the Net-Net screen (`NCAV Latest (Cr)`, `NCAVCashInvRec
-    Latest (Cr)` — the two asset bases) — all are the latest completed fiscal
-    year's value, not a 10-year history, since those screens check a
-    balance-sheet snapshot, not a consistency bar.
+    Latest (Cr)`), the Net-Net screen (`NCAV Latest (Cr)`, `NCAVCashInvRec
+    Latest (Cr)` — the two asset bases) and the Vantage screen (`Cash Latest
+    (Cr)`, plus `Int Y1 (Cr)`..`Int Y10 (Cr)` and `CFO Y1 (Cr)`..`CFO Y10
+    (Cr)` — a 10-year raw series, not a precomputed average, since Vantage's
+    year-weighting is user-adjustable and must be recomputable instantly on
+    every rerun) — all are the latest completed fiscal year's value or a raw
+    10-year series, not a fixed consistency bar, since these screens check a
+    balance-sheet snapshot or a configurable weighted average.
     Price/P·E/Market Cap are *not* here — `merge_market_data()` reads those
     straight from the `Market` sheet on every page load instead, since Price
     changes far more often than fundamentals do.
@@ -574,11 +578,19 @@ def build_universe_cache(
             if "NCAV" in income_statement.index and annual_cols else float("nan"),
             "NCAVCashInvRec Latest (Cr)": income_statement.loc["NCAVCashInvRec", annual_cols[0]]
             if "NCAVCashInvRec" in income_statement.index and annual_cols else float("nan"),
+            "Cash Latest (Cr)": balance_sheet.loc["Cash", annual_bs_cols[0]]
+            if "Cash" in balance_sheet.index and annual_bs_cols else float("nan"),
         }
         for is_row in rows_needed:
             row_values = _numeric_row(income_statement, is_row)
             for y in range(10):
                 row[f"{is_row} Y{y + 1} (%)"] = row_values[annual_cols[y]] if y < len(annual_cols) else float("nan")
+
+        int_values = _numeric_row(income_statement, "Int")
+        cfo_values = _numeric_row(balance_sheet, "CFO")
+        for y in range(10):
+            row[f"Int Y{y + 1} (Cr)"] = int_values[annual_cols[y]] if y < len(annual_cols) else float("nan")
+            row[f"CFO Y{y + 1} (Cr)"] = cfo_values[annual_bs_cols[y]] if y < len(annual_bs_cols) else float("nan")
         rows.append(row)
 
         if progress_callback and (i % 25 == 0 or i == total - 1):
@@ -749,6 +761,118 @@ def net_net_passes(universe: pd.DataFrame, ncav_column: str) -> pd.Series:
     return result
 
 
+def weighted_average_by_year(universe: pd.DataFrame, row_prefix: str, unit: str, decay: float, years: int = 10) -> pd.Series:
+    """Decay-weighted average of `{row_prefix} Y1 ({unit})`..`{row_prefix}
+    Y{years} ({unit})`: weight for the i-th most recent year is `decay**(i-1)`,
+    so Y1 (the latest completed FY) always weighs most and a decay < 1 fades
+    older years out smoothly (decay=1 is a plain average). NaN if any of the
+    `years` years is missing — same "needs the full window" convention as
+    metric_moat_passes, since an average over a partial window would silently
+    mean something different depending on which years happened to be present.
+    """
+    cols = [f"{row_prefix} Y{y} ({unit})" for y in range(1, years + 1)]
+    values = universe[cols].apply(pd.to_numeric, errors="coerce")
+    weights = [decay**i for i in range(years)]
+    has_full_history = values.notna().all(axis=1)
+    weighted_sum = sum(values[col] * w for col, w in zip(cols, weights))
+    result = weighted_sum / sum(weights)
+    return result.where(has_full_history)
+
+
+def vantage_metrics(universe: pd.DataFrame, decay: float, rate: float, years: int = 10) -> pd.DataFrame:
+    """Sanjay Bakshi's "Vantage" banker's-valuation pipeline, universe-wide:
+
+    WA_CFO / WA_Interest = weighted_average_by_year(..., "CFO"/"Int", "Cr", decay, years)
+    Cashflow = WA_CFO - WA_Interest
+    InterestServiceable = Cashflow / 3      (fixed divisor — not user-configurable)
+    Loan = InterestServiceable / rate       (rate as a decimal, e.g. 0.10 for 10%)
+    TotalValue = Loan + Cash (latest year)
+    Multiple = Market Cap (Cr) / TotalValue — via _safe_divide, which lets a
+        negative TotalValue pass through as a negative Multiple rather than
+        masking it, since "Multiple <= 0" (Loan swamps Cash) is exactly the
+        signal callers filter out with a "> 0" lower bound.
+
+    Requires `universe` to already have `Market Cap (Cr)` (i.e., called after
+    merge_market_data()) and the `CFO`/`Int` Y1..years and `Cash Latest (Cr)`
+    columns build_universe_cache() provides.
+    """
+    wa_cfo = weighted_average_by_year(universe, "CFO", "Cr", decay, years)
+    wa_interest = weighted_average_by_year(universe, "Int", "Cr", decay, years)
+    cashflow = wa_cfo - wa_interest
+    interest_serviceable = cashflow / 3
+    loan = interest_serviceable / rate
+    cash = pd.to_numeric(universe["Cash Latest (Cr)"], errors="coerce")
+    total_value = loan + cash
+    mcap = pd.to_numeric(universe["Market Cap (Cr)"], errors="coerce")
+    multiple = _safe_divide(mcap, total_value)
+
+    return pd.DataFrame(
+        {
+            "WA CFO (Cr)": wa_cfo.round(2),
+            "WA Interest (Cr)": wa_interest.round(2),
+            "Cashflow (Cr)": cashflow.round(2),
+            "Interest Serviceable (Cr)": interest_serviceable.round(2),
+            "Loan (Cr)": loan.round(2),
+            "Total Value (Cr)": total_value.round(2),
+            "Multiple": multiple.round(2),
+        },
+        index=universe.index,
+    )
+
+
+def company_vantage_metrics(
+    income_statement: pd.DataFrame, balance_sheet: pd.DataFrame, price: float, decay: float, rate: float, years: int = 10
+) -> dict:
+    """Per-company equivalent of vantage_metrics(), for Data Explorer: builds
+    a one-row, universe-cache-shaped frame from this company's own tables and
+    feeds it through the same vantage_metrics() pipeline (no duplicated math),
+    then adds a NOS-based Value/Share and Price-based Multiple for display —
+    the universe-wide screen uses Market Cap / Total Value directly and never
+    needs a share count at all (see vantage_metrics' docstring on why the two
+    Multiples can diverge slightly).
+    """
+    annual_cols = [c for c in income_statement.columns if c != "TTM"]
+    annual_bs_cols = list(balance_sheet.columns)
+    int_row = _numeric_row(income_statement, "Int")
+    cfo_row = _numeric_row(balance_sheet, "CFO")
+
+    one_row = {
+        "Cash Latest (Cr)": [
+            balance_sheet.loc["Cash", annual_bs_cols[0]] if "Cash" in balance_sheet.index and annual_bs_cols else float("nan")
+        ],
+        "Market Cap (Cr)": [float("nan")],  # not used for this function's Multiple — see docstring
+    }
+    for y in range(years):
+        one_row[f"Int Y{y + 1} (Cr)"] = [int_row[annual_cols[y]] if y < len(annual_cols) else float("nan")]
+        one_row[f"CFO Y{y + 1} (Cr)"] = [cfo_row[annual_bs_cols[y]] if y < len(annual_bs_cols) else float("nan")]
+
+    metrics = vantage_metrics(pd.DataFrame(one_row), decay, rate, years).iloc[0]
+
+    shares_latest = (
+        balance_sheet.loc["NOS", annual_bs_cols[0]] if "NOS" in balance_sheet.index and annual_bs_cols else float("nan")
+    )
+    shares_latest = pd.to_numeric(pd.Series([shares_latest]), errors="coerce").iloc[0]
+    total_value = metrics["Total Value (Cr)"]
+    value_per_share = (
+        total_value * CRORE / shares_latest
+        if pd.notna(total_value) and pd.notna(shares_latest) and shares_latest
+        else float("nan")
+    )
+    multiple = price / value_per_share if pd.notna(price) and pd.notna(value_per_share) and value_per_share else float("nan")
+
+    return {
+        "wa_cfo": metrics["WA CFO (Cr)"],
+        "wa_interest": metrics["WA Interest (Cr)"],
+        "cashflow": metrics["Cashflow (Cr)"],
+        "interest_serviceable": metrics["Interest Serviceable (Cr)"],
+        "loan": metrics["Loan (Cr)"],
+        "cash": one_row["Cash Latest (Cr)"][0],
+        "total_value": total_value,
+        "value_per_share": value_per_share,
+        "multiple": multiple,
+    }
+
+
 def and_tri_state(a: pd.Series, b: pd.Series) -> pd.Series:
     """Three-valued AND of two tri-state (True/False/pd.NA) Series: False
     dominates (even over the other side's NA, since AND-ing with a definite
@@ -794,18 +918,19 @@ def failure_detail(values: pd.Series, threshold: float, direction: str, consiste
 
 def evaluate_screens_for_company(universe: pd.DataFrame, symbol: str, overrides: dict) -> pd.DataFrame:
     """Evaluate every screen (SSGR, all MOAT_METRIC_CONFIG entries, the 2 CCP
-    lists, Vijay Malik, and the 2 Net-Net lists) for one company, using the
-    same formulas `pages/screens.py` uses for the whole universe. `overrides`
-    (resolved by the caller from st.session_state, kept out of this function
-    to stay UI-free): {config_key: {"use_industry": bool, "manual": float}}
-    for every MOAT_METRIC_CONFIG key, plus "ccp": {"roce": float, "growth":
-    float, "years": int}, "vijay_malik": {check["key"]: float, ...} for each
-    of VIJAY_MALIK_CHECKS, and "net_net": {"min_mcap": float} (the shared
-    Market Cap floor both Net-Net lists apply on top of their own Mcap<NCAV
-    comparison — mirrors how CCP's two ROCE variants share one revenue-growth
-    check). Returns one row per screen: Filter, Group, Passes
-    (True/False/pd.NA), Detail ("—" if passing, "not enough
-    history"/"not enough data" if NA, else a failure explanation).
+    lists, Vijay Malik, the 2 Net-Net lists, and Vantage) for one company,
+    using the same formulas `pages/screens.py` uses for the whole universe.
+    `overrides` (resolved by the caller from st.session_state, kept out of
+    this function to stay UI-free): {config_key: {"use_industry": bool,
+    "manual": float}} for every MOAT_METRIC_CONFIG key, plus "ccp": {"roce":
+    float, "growth": float, "years": int}, "vijay_malik": {check["key"]:
+    float, ...} for each of VIJAY_MALIK_CHECKS, "net_net": {"min_mcap": float}
+    (the shared Market Cap floor both Net-Net lists apply on top of their own
+    Mcap<NCAV comparison — mirrors how CCP's two ROCE variants share one
+    revenue-growth check), and "vantage": {"decay": float, "rate": float,
+    "min_threshold": float, "max_threshold": float}. Returns one row per
+    screen: Filter, Group, Passes (True/False/pd.NA), Detail ("—" if passing,
+    "not enough history"/"not enough data" if NA, else a failure explanation).
     """
     columns = ["Filter", "Group", "Passes", "Detail"]
     match = universe.loc[universe["Symbol"] == symbol]
@@ -816,6 +941,7 @@ def evaluate_screens_for_company(universe: pd.DataFrame, symbol: str, overrides:
             + [(cfg["label"], "Moats" if cfg["group"] == "moats" else "Nalanda's F") for cfg in MOAT_METRIC_CONFIG.values()]
             + [("CCP – Regular ROCE", "CCP"), ("CCP – Nalanda's F", "CCP"), ("Vijay Malik", "Vijay Malik")]
             + [("Net-Net – Full Current Assets", "Net-Net"), ("Net-Net – Cash+Inv+Rec", "Net-Net")]
+            + [("Vantage", "Vantage")]
         ]
         return pd.DataFrame(rows, columns=columns)
 
@@ -938,6 +1064,39 @@ def evaluate_screens_for_company(universe: pd.DataFrame, symbol: str, overrides:
             detail = "; ".join(reasons) if reasons else "not enough data"
 
         rows.append((label, "Net-Net", passes, detail))
+
+    vantage_overrides = overrides.get("vantage", {})
+    decay = vantage_overrides.get("decay", 0.85)
+    rate = vantage_overrides.get("rate", 0.10)
+    min_threshold = vantage_overrides.get("min_threshold", 0.0)
+    max_threshold = vantage_overrides.get("max_threshold", 1.0)
+
+    vm = vantage_metrics(universe, decay, rate)
+    multiple = vm["Multiple"]
+    above_min = scalar_metric_passes(multiple, min_threshold, "higher")
+    below_max = scalar_metric_passes(multiple, max_threshold, "lower")
+    vantage_passes = and_tri_state(above_min, below_max).loc[idx]
+
+    if pd.isna(vantage_passes):
+        vantage_detail = "not enough data"
+    elif vantage_passes:
+        vantage_detail = "—"
+    else:
+        multiple_val = vm.loc[idx, "Multiple"]
+        mcap_val, tv_val = urow["Market Cap (Cr)"], vm.loc[idx, "Total Value (Cr)"]
+        reasons = []
+        if above_min.loc[idx] is False:
+            reasons.append(
+                f"Multiple {multiple_val:.2f} (Market Cap ₹{mcap_val:.2f} Cr / Total Value ₹{tv_val:.2f} Cr) "
+                f"is not above {min_threshold:.2f} (Total Value is negative — Loan swamps Cash)"
+                if tv_val < 0
+                else f"Multiple {multiple_val:.2f} is not above {min_threshold:.2f}"
+            )
+        if below_max.loc[idx] is False:
+            reasons.append(f"Multiple {multiple_val:.2f} is not below {max_threshold:.2f}")
+        vantage_detail = "; ".join(reasons) if reasons else "not enough data"
+
+    rows.append(("Vantage", "Vantage", vantage_passes, vantage_detail))
 
     return pd.DataFrame(rows, columns=columns)
 

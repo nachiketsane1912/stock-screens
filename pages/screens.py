@@ -19,6 +19,7 @@ from data_loader import (
     net_net_passes,
     save_universe_cache,
     scalar_metric_passes,
+    vantage_metrics,
     vijay_malik_passes,
 )
 
@@ -461,11 +462,73 @@ def render_net_net_tab(universe: pd.DataFrame) -> None:
         st.divider()
 
 
+def render_vantage_tab(universe: pd.DataFrame) -> None:
+    """Vantage (Sanjay Bakshi's banker's-valuation) tab: value a company the
+    way a banker sizing up collateral would (decay-weighted 10Y CFO/Interest
+    -> a loan capacity + cash -> a Total Value), then flag it when Market Cap
+    sits inside a configurable multiple-of-that-value range. No industry
+    percentile — fixed, user-adjustable thresholds, same as CCP/Vijay Malik.
+    """
+    st.subheader("Vantage")
+    st.caption(
+        "Sanjay Bakshi's Vantage analysis: decay-weighted 10-year CFO and Interest give a Cashflow, "
+        "1/3 of which is Interest Serviceable; dividing by the lending rate gives the Loan a banker would be "
+        "happy to extend; adding Cash gives Total Value. Passes when Market Cap / Total Value (the \"Multiple\") "
+        "falls strictly between the two bounds below — the lower bound rules out a negative Total Value "
+        "(Loan swamps Cash) ever masquerading as \"cheap\"."
+    )
+
+    col1, col2 = st.columns(2)
+    decay = col1.slider("Recency decay (per year back)", min_value=0.0, max_value=1.0, value=0.85, step=0.05, key="vantage_decay")
+    rate_pct = col2.number_input("Corporate lending rate (%)", value=10.0, step=0.5, key="vantage_rate")
+
+    col3, col4 = st.columns(2)
+    min_threshold = col3.number_input("Min Price Multiple", value=0.0, step=0.1, key="vantage_min_threshold")
+    max_threshold = col4.number_input("Max Price Multiple", value=1.0, step=0.1, key="vantage_max_threshold")
+
+    # Shadow-copy into plain keys, same fix as every other screen's controls,
+    # so the Data Explorer page's Filters section and Vantage block read the
+    # current setting reliably.
+    st.session_state["vantage_decay_saved"] = decay
+    st.session_state["vantage_rate_saved"] = rate_pct / 100
+    st.session_state["vantage_min_threshold_saved"] = min_threshold
+    st.session_state["vantage_max_threshold_saved"] = max_threshold
+
+    vm = vantage_metrics(universe, decay, rate_pct / 100)
+    above_min = scalar_metric_passes(vm["Multiple"], min_threshold, "higher")
+    below_max = scalar_metric_passes(vm["Multiple"], max_threshold, "lower")
+    passes = and_tri_state(above_min, below_max)
+
+    combined = universe[["Symbol", "Industry", "Market Cap (Cr)"]].join(vm)
+    passing = combined[passes == True].copy()  # noqa: E712 (NA/False must not match)
+    passing = passing.sort_values("Multiple", ascending=True)
+
+    search = st.text_input("Search by symbol or industry", key="vantage_search")
+    if search:
+        mask = passing["Symbol"].str.contains(search, case=False, na=False) | passing[
+            "Industry"
+        ].str.contains(search, case=False, na=False)
+        passing = passing[mask]
+
+    st.caption(f"**{len(passing)}** of {len(universe)} companies pass")
+
+    display_cols = ["Symbol", "Industry", "WA CFO (Cr)", "WA Interest (Cr)", "Total Value (Cr)", "Market Cap (Cr)", "Multiple"]
+    event = st.dataframe(
+        passing[display_cols],
+        use_container_width=True,
+        hide_index=True,
+        on_select="rerun",
+        selection_mode="single-row",
+        key="vantage_table",
+    )
+    drill_through(event, passing)
+
+
 moats_configs = {k: v for k, v in MOAT_METRIC_CONFIG.items() if v["group"] == "moats"}
 nalanda_configs = {k: v for k, v in MOAT_METRIC_CONFIG.items() if v["group"] == "nalanda"}
 
-tab_ssgr, tab_moats, tab_nalanda, tab_ccp, tab_vijay_malik, tab_net_net = st.tabs(
-    ["SSGR", "Moats", "Nalanda's F", "CCP", "Vijay Malik", "Net-Net"]
+tab_ssgr, tab_moats, tab_nalanda, tab_ccp, tab_vijay_malik, tab_net_net, tab_vantage = st.tabs(
+    ["SSGR", "Moats", "Nalanda's F", "CCP", "Vijay Malik", "Net-Net", "Vantage"]
 )
 
 with tab_ssgr:
@@ -508,3 +571,6 @@ with tab_vijay_malik:
 
 with tab_net_net:
     render_net_net_tab(universe)
+
+with tab_vantage:
+    render_vantage_tab(universe)

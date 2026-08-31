@@ -4,6 +4,7 @@ import streamlit as st
 from data_loader import (
     MOAT_METRIC_CONFIG,
     VIJAY_MALIK_CHECKS,
+    company_vantage_metrics,
     evaluate_screens_for_company,
     get_company_view,
     load_raw,
@@ -50,6 +51,11 @@ if symbol:
     view = get_company_view(symbol, sheets)
     st.subheader(f"{symbol} — {view['industry']}")
 
+    vantage_decay = st.session_state.get("vantage_decay_saved", 0.85)
+    vantage_rate = st.session_state.get("vantage_rate_saved", 0.10)
+    vantage_min_threshold = st.session_state.get("vantage_min_threshold_saved", 0.0)
+    vantage_max_threshold = st.session_state.get("vantage_max_threshold_saved", 1.0)
+
     st.markdown("**Filters**")
     universe = load_universe_cache()
     if universe is None:
@@ -79,6 +85,12 @@ if symbol:
         overrides["net_net"] = {
             "min_mcap": st.session_state.get("net_net_min_mcap_saved", 0.0),
         }
+        overrides["vantage"] = {
+            "decay": vantage_decay,
+            "rate": vantage_rate,
+            "min_threshold": vantage_min_threshold,
+            "max_threshold": vantage_max_threshold,
+        }
         st.dataframe(
             evaluate_screens_for_company(universe, symbol, overrides), use_container_width=True, hide_index=True
         )
@@ -91,6 +103,21 @@ if symbol:
     mcol3.metric("P/E", f"{market['pe']:.2f}" if pd.notna(market["pe"]) else "—")
     if pd.isna(market["price"]):
         st.caption("Add a `Market` sheet (Symbol, CMP, PE, Market cap (INR Cr)) to Raw data.xlsx to see this.")
+
+    st.markdown("**Vantage**")
+    vantage = company_vantage_metrics(
+        view["income_statement"], view["balance_sheet"], market["price"], vantage_decay, vantage_rate
+    )
+    vcol1, vcol2, vcol3, vcol4 = st.columns(4)
+    vcol1.metric("WA CFO (₹ Cr)", f"{vantage['wa_cfo']:.2f}" if pd.notna(vantage["wa_cfo"]) else "—")
+    vcol2.metric("WA Interest (₹ Cr)", f"{vantage['wa_interest']:.2f}" if pd.notna(vantage["wa_interest"]) else "—")
+    vcol3.metric("Loan (₹ Cr)", f"{vantage['loan']:.2f}" if pd.notna(vantage["loan"]) else "—")
+    vcol4.metric("Total Value (₹ Cr)", f"{vantage['total_value']:.2f}" if pd.notna(vantage["total_value"]) else "—")
+    vcol5, vcol6, vcol7, vcol8 = st.columns(4)
+    vcol5.metric("Cashflow (₹ Cr)", f"{vantage['cashflow']:.2f}" if pd.notna(vantage["cashflow"]) else "—")
+    vcol6.metric("Interest Serviceable (₹ Cr)", f"{vantage['interest_serviceable']:.2f}" if pd.notna(vantage["interest_serviceable"]) else "—")
+    vcol7.metric("Value/Share (₹)", f"{vantage['value_per_share']:.2f}" if pd.notna(vantage["value_per_share"]) else "—")
+    vcol8.metric("Multiple", f"{vantage['multiple']:.2f}" if pd.notna(vantage["multiple"]) else "—")
 
     st.markdown("**Quarterly financials**")
     st.dataframe(view["quarterly"], use_container_width=True)

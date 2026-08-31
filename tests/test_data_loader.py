@@ -17,6 +17,7 @@ from data_loader import (
     build_cagr_table,
     build_universe_cache,
     company_metric_table,
+    company_vantage_metrics,
     evaluate_screens_for_company,
     failure_detail,
     get_company_view,
@@ -28,7 +29,9 @@ from data_loader import (
     net_net_passes,
     save_universe_cache,
     scalar_metric_passes,
+    vantage_metrics,
     vijay_malik_passes,
+    weighted_average_by_year,
 )
 
 
@@ -522,8 +525,9 @@ def test_build_universe_cache_returns_one_row_per_symbol_and_reports_progress():
     expected_cols = {
         "Symbol", "Industry", "SSGR (%)", "Rev 10Y CAGR (%)", "SSGR Passes",
         "Net 10Y CAGR (%)", "DebtEquity Latest (%)", "CFO Latest (Cr)", "NCAV Latest (Cr)",
-        "NCAVCashInvRec Latest (Cr)",
+        "NCAVCashInvRec Latest (Cr)", "Cash Latest (Cr)",
     }
+    expected_cols |= {f"Int Y{y} (Cr)" for y in range(1, 11)} | {f"CFO Y{y} (Cr)" for y in range(1, 11)}
     rows_needed = {config["row"] for config in MOAT_METRIC_CONFIG.values()} | CCP_EXTRA_CACHE_ROWS
     expected_cols |= {f"{row} Y{y} (%)" for row in rows_needed for y in range(1, 11)}
     assert list(result["Symbol"]) == ["AAA", "BBB"]
@@ -777,6 +781,80 @@ def test_net_net_passes_uses_the_given_ncav_column():
     assert net_net_passes(universe, "NCAVCashInvRec Latest (Cr)").iloc[0] is False
 
 
+# --- weighted_average_by_year -------------------------------------------------------
+
+def test_weighted_average_by_year_decay_weighting():
+    universe = pd.DataFrame({"CFO Y1 (Cr)": [30.0], "CFO Y2 (Cr)": [20.0], "CFO Y3 (Cr)": [10.0]})
+
+    result = weighted_average_by_year(universe, "CFO", "Cr", decay=0.5, years=3)
+
+    # weights 1, 0.5, 0.25 (sum 1.75) -> (30*1 + 20*0.5 + 10*0.25) / 1.75
+    assert result.iloc[0] == pytest.approx((30 + 10 + 2.5) / 1.75)
+
+
+def test_weighted_average_by_year_missing_year_is_nan():
+    universe = pd.DataFrame({"CFO Y1 (Cr)": [30.0], "CFO Y2 (Cr)": [float("nan")], "CFO Y3 (Cr)": [10.0]})
+    result = weighted_average_by_year(universe, "CFO", "Cr", decay=0.5, years=3)
+    assert pd.isna(result.iloc[0])
+
+
+# --- vantage_metrics ----------------------------------------------------------------
+
+def _vantage_universe(cfo: float, interest: float, cash: float, market_cap: float) -> pd.DataFrame:
+    row = {"Cash Latest (Cr)": [cash], "Market Cap (Cr)": [market_cap]}
+    for y in range(1, 11):
+        row[f"CFO Y{y} (Cr)"] = [cfo]
+        row[f"Int Y{y} (Cr)"] = [interest]
+    return pd.DataFrame(row)
+
+
+def test_vantage_metrics_matches_hand_computed_values():
+    universe = _vantage_universe(cfo=500.0, interest=50.0, cash=200.0, market_cap=1000.0)
+
+    result = vantage_metrics(universe, decay=0.85, rate=0.10)
+
+    assert result.loc[0, "WA CFO (Cr)"] == 500.0
+    assert result.loc[0, "WA Interest (Cr)"] == 50.0
+    assert result.loc[0, "Cashflow (Cr)"] == 450.0
+    assert result.loc[0, "Interest Serviceable (Cr)"] == 150.0
+    assert result.loc[0, "Loan (Cr)"] == 1500.0
+    assert result.loc[0, "Total Value (Cr)"] == 1700.0
+    assert result.loc[0, "Multiple"] == pytest.approx(round(1000 / 1700, 2))
+
+
+def test_vantage_metrics_negative_total_value_gives_negative_multiple():
+    # Interest exceeds CFO -> Cashflow/InterestServiceable/Loan all negative;
+    # Loan swamps Cash -> Total Value negative -> Multiple negative (not masked).
+    universe = _vantage_universe(cfo=10.0, interest=100.0, cash=50.0, market_cap=1000.0)
+
+    result = vantage_metrics(universe, decay=0.85, rate=0.10)
+
+    assert result.loc[0, "Cashflow (Cr)"] == -90.0
+    assert result.loc[0, "Total Value (Cr)"] == pytest.approx(-250.0)
+    assert result.loc[0, "Multiple"] == pytest.approx(-4.0)
+    assert scalar_metric_passes(result["Multiple"], 0.0, "higher").iloc[0] is False
+
+
+# --- company_vantage_metrics ---------------------------------------------------------
+
+def test_company_vantage_metrics_matches_hand_computed_values():
+    years = [str(y) for y in range(26, 16, -1)]
+    is_table = make_table({"Int": [50.0] * 10}, columns=years)
+    bs_table = make_table({"CFO": [500.0] * 10, "Cash": [200.0] * 10, "NOS": [10_000_000.0] * 10}, columns=years)
+
+    result = company_vantage_metrics(is_table, bs_table, price=850.0, decay=0.85, rate=0.10)
+
+    assert result["wa_cfo"] == 500.0
+    assert result["wa_interest"] == 50.0
+    assert result["cashflow"] == 450.0
+    assert result["interest_serviceable"] == 150.0
+    assert result["loan"] == 1500.0
+    assert result["cash"] == 200.0
+    assert result["total_value"] == 1700.0
+    assert result["value_per_share"] == pytest.approx(1700.0)  # 1 crore shares -> Cr value == per-share value
+    assert result["multiple"] == pytest.approx(0.5)  # 850/1700
+
+
 # --- moat_score -------------------------------------------------------------------
 
 def test_moat_score_counts_true_only_and_treats_na_as_zero():
@@ -839,9 +917,10 @@ _COMFORTABLE_PASS_VALUES = {
 def make_universe_df(companies: list[dict]) -> pd.DataFrame:
     """Build a synthetic universe-cache-shaped DataFrame. Each company dict needs
     "Symbol"/"Industry", optionally "ssgr_pct"/"rev_cagr"/"ssgr_passes"/
-    "net_cagr"/"debt_equity"/"cfo"/"market_cap"/"ncav"/"ncav_cash_inv_rec", and
-    optionally a list of 10 values for any key in _COMFORTABLE_PASS_VALUES to
-    override that row (everything else defaults to a flat comfortable-pass value).
+    "net_cagr"/"debt_equity"/"cfo"/"market_cap"/"ncav"/"ncav_cash_inv_rec"/
+    "cash_latest"/"vantage_cfo"/"vantage_int" (the last two as 10-value lists),
+    and optionally a list of 10 values for any key in _COMFORTABLE_PASS_VALUES
+    to override that row (everything else defaults to a flat comfortable-pass value).
     """
     records = []
     for company in companies:
@@ -857,7 +936,16 @@ def make_universe_df(companies: list[dict]) -> pd.DataFrame:
             "Market Cap (Cr)": company.get("market_cap", 1000.0),
             "NCAV Latest (Cr)": company.get("ncav", 2000.0),  # > Market Cap default (1000.0), so Net-Net passes
             "NCAVCashInvRec Latest (Cr)": company.get("ncav_cash_inv_rec", 2000.0),
+            # Flat CFO=500/Int=50/Cash=200 -> Cashflow=450, InterestServiceable=150,
+            # Loan=1500 (at the default 10% rate), TotalValue=1700 -> Multiple ~0.59
+            # (comfortably inside the default 0..1 Vantage pass range vs. Market Cap 1000.0).
+            "Cash Latest (Cr)": company.get("cash_latest", 200.0),
         }
+        vantage_cfo = company.get("vantage_cfo", [500.0] * 10)
+        vantage_int = company.get("vantage_int", [50.0] * 10)
+        for y in range(1, 11):
+            record[f"CFO Y{y} (Cr)"] = vantage_cfo[y - 1]
+            record[f"Int Y{y} (Cr)"] = vantage_int[y - 1]
         for row, default_val in _COMFORTABLE_PASS_VALUES.items():
             values = company.get(row, [default_val] * 10)
             for y in range(1, 11):
@@ -871,6 +959,7 @@ def _default_overrides() -> dict:
     overrides["ccp"] = {"roce": 15, "growth": 10, "years": 10}
     overrides["vijay_malik"] = {"sales_cagr": 15, "net_cagr": 30, "debt_equity": 100, "cfo": 0, "market_cap": 500}
     overrides["net_net"] = {"min_mcap": 0.0}
+    overrides["vantage"] = {"decay": 0.85, "rate": 0.10, "min_threshold": 0.0, "max_threshold": 1.0}
     return overrides
 
 
@@ -881,7 +970,7 @@ def test_evaluate_screens_for_company_all_pass():
 
     result = evaluate_screens_for_company(universe, "PASSER", _default_overrides())
 
-    assert len(result) == 17  # SSGR + 7 moats + 4 nalanda + 2 ccp + vijay malik + 2 net-net
+    assert len(result) == 18  # SSGR + 7 moats + 4 nalanda + 2 ccp + vijay malik + 2 net-net + vantage
     assert (result["Passes"] == True).all()  # noqa: E712
     assert (result["Detail"] == "—").all()
 
@@ -983,11 +1072,49 @@ def test_evaluate_screens_for_company_net_net_market_cap_floor():
     assert "5000.00" in full_row["Detail"]
 
 
+def test_evaluate_screens_for_company_vantage_fails_when_multiple_too_high():
+    # Comfortable-pass Vantage inputs (CFO=500/Int=50/Cash=200 -> Total Value 1700)
+    # but a Market Cap well above Total Value -> Multiple > 1.
+    universe = make_universe_df([{"Symbol": "PRICEY", "Industry": "Ind X", "market_cap": 3000.0}])
+
+    result = evaluate_screens_for_company(universe, "PRICEY", _default_overrides())
+
+    vantage_row = result[result["Filter"] == "Vantage"].iloc[0]
+    assert vantage_row["Passes"] == False  # noqa: E712
+    assert "not below 1.00" in vantage_row["Detail"]
+
+
+def test_evaluate_screens_for_company_vantage_fails_when_loan_swamps_cash():
+    # Interest far exceeds CFO -> Cashflow/Loan negative -> Total Value negative
+    # -> Multiple negative -> fails the "> 0" lower bound specifically.
+    universe = make_universe_df([
+        {"Symbol": "DISTRESSED", "Industry": "Ind X", "vantage_int": [1000.0] * 10},
+    ])
+
+    result = evaluate_screens_for_company(universe, "DISTRESSED", _default_overrides())
+
+    vantage_row = result[result["Filter"] == "Vantage"].iloc[0]
+    assert vantage_row["Passes"] == False  # noqa: E712
+    assert "Loan swamps Cash" in vantage_row["Detail"]
+
+
+def test_evaluate_screens_for_company_vantage_missing_year_is_not_enough_data():
+    universe = make_universe_df([
+        {"Symbol": "MISSING", "Industry": "Ind X", "vantage_cfo": [500.0] * 9 + [float("nan")]},
+    ])
+
+    result = evaluate_screens_for_company(universe, "MISSING", _default_overrides())
+
+    vantage_row = result[result["Filter"] == "Vantage"].iloc[0]
+    assert pd.isna(vantage_row["Passes"])
+    assert vantage_row["Detail"] == "not enough data"
+
+
 def test_evaluate_screens_for_company_symbol_not_in_universe():
     universe = make_universe_df([{"Symbol": "PASSER", "Industry": "Ind X"}])
 
     result = evaluate_screens_for_company(universe, "NOT_THERE", _default_overrides())
 
-    assert len(result) == 17
+    assert len(result) == 18
     assert result["Passes"].isna().all()
     assert (result["Detail"] == "not in Screens cache — click Refresh on the Screens page").all()
