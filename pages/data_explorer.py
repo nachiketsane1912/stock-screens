@@ -76,6 +76,9 @@ if symbol:
             check["key"]: st.session_state.get(f"vm_{check['key']}_saved", check["default"])
             for check in VIJAY_MALIK_CHECKS
         }
+        overrides["net_net"] = {
+            "min_mcap": st.session_state.get("net_net_min_mcap_saved", 0.0),
+        }
         st.dataframe(
             evaluate_screens_for_company(universe, symbol, overrides), use_container_width=True, hide_index=True
         )

@@ -317,8 +317,8 @@ def add_capex_and_ratios(is_table: pd.DataFrame, bs_table: pd.DataFrame) -> pd.D
 
 
 def add_roce(is_table: pd.DataFrame, bs_table: pd.DataFrame) -> pd.DataFrame:
-    """Add WC, CapitalEmployed, ROCE, CapitalEmployedExCash and ROCEExCash rows
-    to an IS table (annual only).
+    """Add WC, CapitalEmployed, ROCE, CapitalEmployedExCash, ROCEExCash, NCAV
+    and NCAVCashInvRec rows to an IS table (annual only).
 
     WC = OA - OL   (the workbook has no granular Current Assets/Liabilities
          split, so this reuses the same OA/OL aggregates as add_bs_totals/
@@ -329,6 +329,12 @@ def add_roce(is_table: pd.DataFrame, bs_table: pd.DataFrame) -> pd.DataFrame:
         basis — excludes cash and investments, both treated as non-operating
         surplus, from capital employed)
     ROCEExCash = PBIT / CapitalEmployedExCash * 100
+    NCAV = WC - Borr   (Net Current Asset Value, Benjamin Graham's "net-net"
+        basis: Current Assets - Total Liabilities excluding equity, i.e.
+        OA - (Borr + OL); since WC is already OA - OL, this is just WC - Borr)
+    NCAVCashInvRec = (Cash + Inv + Rec) - (Borr + OL)   (a more conservative
+        net-net basis: only cash, inventory and receivables count as "current
+        assets", not all of OA's other current-asset odds and ends)
     """
     if is_table.empty or bs_table.empty:
         return is_table
@@ -341,6 +347,9 @@ def add_roce(is_table: pd.DataFrame, bs_table: pd.DataFrame) -> pd.DataFrame:
     wip = _numeric_row(bs_table, "WIP").reindex(is_table.columns)
     invest = _numeric_row(bs_table, "Invest").reindex(is_table.columns)
     cash = _numeric_row(bs_table, "Cash").reindex(is_table.columns)
+    borr = _numeric_row(bs_table, "Borr").reindex(is_table.columns)
+    inv = _numeric_row(bs_table, "Inv").reindex(is_table.columns)
+    rec = _numeric_row(bs_table, "Rec").reindex(is_table.columns)
 
     wc = oa - ol
     capital_employed = nb + wip + invest + wc
@@ -351,6 +360,8 @@ def add_roce(is_table: pd.DataFrame, bs_table: pd.DataFrame) -> pd.DataFrame:
     is_table.loc["ROCE"] = (_safe_divide(pbit, capital_employed) * 100).round(2)
     is_table.loc["CapitalEmployedExCash"] = capital_employed_ex_cash.round(2)
     is_table.loc["ROCEExCash"] = (_safe_divide(pbit, capital_employed_ex_cash) * 100).round(2)
+    is_table.loc["NCAV"] = (wc - borr).round(2)
+    is_table.loc["NCAVCashInvRec"] = ((cash + inv + rec) - (borr + ol)).round(2)
 
     return is_table
 
@@ -526,14 +537,15 @@ def build_universe_cache(
     config key — several screens can share one row, e.g. ROCE's Median and 10Y
     variants), "{row} Y1 (%)" .. "{row} Y10 (%)" — that row's value for the 10
     most recent completed fiscal years (Y1 = latest completed FY), NaN where
-    fewer than 10 years exist. Also includes three single-scalar columns for
-    the Vijay Malik screen: `Net 10Y CAGR (%)`, `DebtEquity Latest (%)`, `CFO
-    Latest (Cr)` (the latter two are the latest completed fiscal year's
-    value, not a 10-year history — that screen checks Debt/Equity and CFO as
-    a snapshot, not a consistency bar). Price/P·E/Market Cap are *not* here —
-    `merge_market_data()` reads those straight from the `Market` sheet on
-    every page load instead, since Price changes far more often than
-    fundamentals do.
+    fewer than 10 years exist. Also includes single-scalar columns for the
+    Vijay Malik screen (`Net 10Y CAGR (%)`, `DebtEquity Latest (%)`, `CFO
+    Latest (Cr)`) and the Net-Net screen (`NCAV Latest (Cr)`, `NCAVCashInvRec
+    Latest (Cr)` — the two asset bases) — all are the latest completed fiscal
+    year's value, not a 10-year history, since those screens check a
+    balance-sheet snapshot, not a consistency bar.
+    Price/P·E/Market Cap are *not* here — `merge_market_data()` reads those
+    straight from the `Market` sheet on every page load instead, since Price
+    changes far more often than fundamentals do.
     """
     rows_needed = {config["row"] for config in MOAT_METRIC_CONFIG.values()} | CCP_EXTRA_CACHE_ROWS
     symbols = sheets["Industry"]["Symbol"].dropna().unique()
@@ -558,6 +570,10 @@ def build_universe_cache(
             if "DebtEquity" in income_statement.index and annual_cols else float("nan"),
             "CFO Latest (Cr)": balance_sheet.loc["CFO", annual_bs_cols[0]]
             if "CFO" in balance_sheet.index and annual_bs_cols else float("nan"),
+            "NCAV Latest (Cr)": income_statement.loc["NCAV", annual_cols[0]]
+            if "NCAV" in income_statement.index and annual_cols else float("nan"),
+            "NCAVCashInvRec Latest (Cr)": income_statement.loc["NCAVCashInvRec", annual_cols[0]]
+            if "NCAVCashInvRec" in income_statement.index and annual_cols else float("nan"),
         }
         for is_row in rows_needed:
             row_values = _numeric_row(income_statement, is_row)
@@ -595,7 +611,13 @@ def merge_market_data(universe: pd.DataFrame, sheets: dict[str, pd.DataFrame]) -
     result = result.merge(market_cols, on="Symbol", how="left")
     result["Price"] = pd.to_numeric(result["Price"], errors="coerce")
     result["PE"] = pd.to_numeric(result["PE"], errors="coerce")
-    result["Market Cap (Cr)"] = pd.to_numeric(result["Market Cap (Cr)"], errors="coerce")
+    market_cap = pd.to_numeric(result["Market Cap (Cr)"], errors="coerce")
+    # A listed operating company can never have zero market cap — a 0 here is a
+    # vendor data-export artifact (seen in practice for a handful of symbols,
+    # including at least one large-cap), not a real value. Treat as missing,
+    # same as the elsewhere-established "non-positive isn't meaningful" pattern
+    # (e.g. _cagr_pct's non-positive endpoints).
+    result["Market Cap (Cr)"] = market_cap.mask(market_cap <= 0)
 
     return result
 
@@ -706,6 +728,27 @@ def vijay_malik_passes(universe: pd.DataFrame, thresholds: dict) -> tuple[dict[s
     return per_check, combined
 
 
+def net_net_passes(universe: pd.DataFrame, ncav_column: str) -> pd.Series:
+    """Tri-state pass/fail for the Net-Net (Benjamin Graham NCAV) screen:
+    True if Market Cap (Cr) < `ncav_column`, False if both are present but
+    the comparison fails (including a negative NCAV, which Market Cap — always
+    positive — can never be below), pd.NA if either is missing. No threshold
+    to configure — this is a straight comparison between two columns, not a
+    scalar-vs-fixed-threshold check like scalar_metric_passes. Requires
+    `universe` to already have `Market Cap (Cr)` (i.e., called after
+    merge_market_data()). `ncav_column` selects which of the two asset bases
+    to compare against — `"NCAV Latest (Cr)"` (Current Assets via OA) or
+    `"NCAVCashInvRec Latest (Cr)"` (Cash + Inventory + Receivables only) — the
+    same "one comparison, two bases" shape CCP uses for its two ROCE variants.
+    """
+    mcap = pd.to_numeric(universe["Market Cap (Cr)"], errors="coerce")
+    ncav = pd.to_numeric(universe[ncav_column], errors="coerce")
+    result = pd.Series(pd.NA, index=universe.index, dtype=object)
+    has_both = mcap.notna() & ncav.notna()
+    result[has_both] = (mcap < ncav)[has_both]
+    return result
+
+
 def and_tri_state(a: pd.Series, b: pd.Series) -> pd.Series:
     """Three-valued AND of two tri-state (True/False/pd.NA) Series: False
     dominates (even over the other side's NA, since AND-ing with a definite
@@ -751,15 +794,18 @@ def failure_detail(values: pd.Series, threshold: float, direction: str, consiste
 
 def evaluate_screens_for_company(universe: pd.DataFrame, symbol: str, overrides: dict) -> pd.DataFrame:
     """Evaluate every screen (SSGR, all MOAT_METRIC_CONFIG entries, the 2 CCP
-    lists, and Vijay Malik) for one company, using the same formulas
-    `pages/screens.py` uses for the whole universe. `overrides` (resolved by
-    the caller from st.session_state, kept out of this function to stay
-    UI-free): {config_key: {"use_industry": bool, "manual": float}} for every
-    MOAT_METRIC_CONFIG key, plus "ccp": {"roce": float, "growth": float,
-    "years": int} and "vijay_malik": {check["key"]: float, ...} for each of
-    VIJAY_MALIK_CHECKS. Returns one row per screen: Filter, Group, Passes
-    (True/False/pd.NA), Detail ("—" if passing, "not enough history"/"not
-    enough data" if NA, else a failure explanation).
+    lists, Vijay Malik, and the 2 Net-Net lists) for one company, using the
+    same formulas `pages/screens.py` uses for the whole universe. `overrides`
+    (resolved by the caller from st.session_state, kept out of this function
+    to stay UI-free): {config_key: {"use_industry": bool, "manual": float}}
+    for every MOAT_METRIC_CONFIG key, plus "ccp": {"roce": float, "growth":
+    float, "years": int}, "vijay_malik": {check["key"]: float, ...} for each
+    of VIJAY_MALIK_CHECKS, and "net_net": {"min_mcap": float} (the shared
+    Market Cap floor both Net-Net lists apply on top of their own Mcap<NCAV
+    comparison — mirrors how CCP's two ROCE variants share one revenue-growth
+    check). Returns one row per screen: Filter, Group, Passes
+    (True/False/pd.NA), Detail ("—" if passing, "not enough
+    history"/"not enough data" if NA, else a failure explanation).
     """
     columns = ["Filter", "Group", "Passes", "Detail"]
     match = universe.loc[universe["Symbol"] == symbol]
@@ -769,6 +815,7 @@ def evaluate_screens_for_company(universe: pd.DataFrame, symbol: str, overrides:
             for label, group in [("SSGR", "SSGR")]
             + [(cfg["label"], "Moats" if cfg["group"] == "moats" else "Nalanda's F") for cfg in MOAT_METRIC_CONFIG.values()]
             + [("CCP – Regular ROCE", "CCP"), ("CCP – Nalanda's F", "CCP"), ("Vijay Malik", "Vijay Malik")]
+            + [("Net-Net – Full Current Assets", "Net-Net"), ("Net-Net – Cash+Inv+Rec", "Net-Net")]
         ]
         return pd.DataFrame(rows, columns=columns)
 
@@ -862,6 +909,35 @@ def evaluate_screens_for_company(universe: pd.DataFrame, symbol: str, overrides:
         vm_detail = "; ".join(reasons) if reasons else "not enough data"
 
     rows.append(("Vijay Malik", "Vijay Malik", vm_passes, vm_detail))
+
+    net_net_overrides = overrides.get("net_net", {})
+    min_mcap = net_net_overrides.get("min_mcap", 0.0)
+    mcap_series = pd.to_numeric(universe["Market Cap (Cr)"], errors="coerce")
+    mcap_floor_passes = scalar_metric_passes(mcap_series, min_mcap, "higher")
+
+    for label, ncav_column in [
+        ("Net-Net – Full Current Assets", "NCAV Latest (Cr)"),
+        ("Net-Net – Cash+Inv+Rec", "NCAVCashInvRec Latest (Cr)"),
+    ]:
+        core_passes = net_net_passes(universe, ncav_column)
+        combined = and_tri_state(core_passes, mcap_floor_passes)
+        passes = combined.loc[idx]
+
+        if pd.isna(passes):
+            detail = "not enough data"
+        elif passes:
+            detail = "—"
+        else:
+            reasons = []
+            if core_passes.loc[idx] is False:
+                mcap_val, ncav_val = urow["Market Cap (Cr)"], urow[ncav_column]
+                reasons.append(f"Market Cap ₹{mcap_val:.2f} Cr is not below NCAV ₹{ncav_val:.2f} Cr")
+            if mcap_floor_passes.loc[idx] is False:
+                mcap_val = urow["Market Cap (Cr)"]
+                reasons.append(f"Market Cap ₹{mcap_val:.2f} Cr is not above the floor ₹{min_mcap:.2f} Cr")
+            detail = "; ".join(reasons) if reasons else "not enough data"
+
+        rows.append((label, "Net-Net", passes, detail))
 
     return pd.DataFrame(rows, columns=columns)
 

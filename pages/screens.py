@@ -16,7 +16,9 @@ from data_loader import (
     merge_market_data,
     metric_moat_passes,
     moat_score,
+    net_net_passes,
     save_universe_cache,
+    scalar_metric_passes,
     vijay_malik_passes,
 )
 
@@ -400,11 +402,70 @@ def render_vijay_malik_tab(universe: pd.DataFrame) -> None:
     drill_through(event, passing)
 
 
+def render_net_net_tab(universe: pd.DataFrame) -> None:
+    """Net-Net (Benjamin Graham NCAV) tab: two lists, each Market Cap below a
+    Net Current Asset Value basis, sharing one Market Cap floor — same "two
+    lists, one shared secondary filter" shape as render_ccp_tab, just with a
+    floor instead of a bar-every-year check.
+    """
+    st.subheader("Net-Net")
+    st.caption(
+        "Benjamin Graham's Net-Net screen: Market Cap below Net Current Asset Value "
+        "(current assets minus Total Liabilities excluding equity). Two lists, sharing the same "
+        "Market Cap floor — one using all of OA as current assets, one using only Cash + Inventory + "
+        "Receivables (a more conservative basis)."
+    )
+
+    min_mcap = st.number_input("Min Market Cap (₹ Cr)", value=0.0, step=10.0, key="net_net_min_mcap")
+
+    # Shadow-copy into a plain key, same fix as render_threshold_controls/render_ccp_tab,
+    # so the Data Explorer page's Filters section reads the current setting reliably.
+    st.session_state["net_net_min_mcap_saved"] = min_mcap
+
+    mcap_series = pd.to_numeric(universe["Market Cap (Cr)"], errors="coerce")
+    mcap_floor_passes = scalar_metric_passes(mcap_series, min_mcap, "higher")
+
+    search = st.text_input("Search by symbol or industry", key="net_net_search")
+
+    lists = [
+        ("Full Current Assets", "NCAV Latest (Cr)"),
+        ("Cash + Inventory + Receivables", "NCAVCashInvRec Latest (Cr)"),
+    ]
+    for label, ncav_col in lists:
+        st.markdown(f"#### {label}")
+        combined = and_tri_state(net_net_passes(universe, ncav_col), mcap_floor_passes)
+        passing = universe[combined == True].copy()  # noqa: E712 (NA/False must not match)
+        passing["Discount to NCAV (%)"] = (
+            (passing[ncav_col] - passing["Market Cap (Cr)"]) / passing[ncav_col] * 100
+        ).round(2)
+        passing = passing.sort_values("Discount to NCAV (%)", ascending=False)
+
+        if search:
+            mask = passing["Symbol"].str.contains(search, case=False, na=False) | passing[
+                "Industry"
+            ].str.contains(search, case=False, na=False)
+            passing = passing[mask]
+
+        st.caption(f"**{len(passing)}** of {len(universe)} companies pass")
+
+        display_cols = ["Symbol", "Industry", ncav_col, "Market Cap (Cr)", "Discount to NCAV (%)"]
+        event = st.dataframe(
+            passing[display_cols],
+            use_container_width=True,
+            hide_index=True,
+            on_select="rerun",
+            selection_mode="single-row",
+            key=f"net_net_{label}_table",
+        )
+        drill_through(event, passing)
+        st.divider()
+
+
 moats_configs = {k: v for k, v in MOAT_METRIC_CONFIG.items() if v["group"] == "moats"}
 nalanda_configs = {k: v for k, v in MOAT_METRIC_CONFIG.items() if v["group"] == "nalanda"}
 
-tab_ssgr, tab_moats, tab_nalanda, tab_ccp, tab_vijay_malik = st.tabs(
-    ["SSGR", "Moats", "Nalanda's F", "CCP", "Vijay Malik"]
+tab_ssgr, tab_moats, tab_nalanda, tab_ccp, tab_vijay_malik, tab_net_net = st.tabs(
+    ["SSGR", "Moats", "Nalanda's F", "CCP", "Vijay Malik", "Net-Net"]
 )
 
 with tab_ssgr:
@@ -444,3 +505,6 @@ with tab_ccp:
 
 with tab_vijay_malik:
     render_vijay_malik_tab(universe)
+
+with tab_net_net:
+    render_net_net_tab(universe)

@@ -25,6 +25,7 @@ from data_loader import (
     merge_market_data,
     metric_moat_passes,
     moat_score,
+    net_net_passes,
     save_universe_cache,
     scalar_metric_passes,
     vijay_malik_passes,
@@ -223,7 +224,8 @@ def test_add_roce_matches_hand_computed_values():
     is_table = make_table({"PBIT": [200.0, 150.0]}, columns=["26", "25"])
     bs_table = make_table(
         {"NB": [100.0, 90.0], "WIP": [20.0, 15.0], "Invest": [30.0, 25.0],
-         "OA": [150.0, 120.0], "OL": [50.0, 40.0], "Cash": [40.0, 30.0]},
+         "OA": [150.0, 120.0], "OL": [50.0, 40.0], "Cash": [40.0, 30.0], "Borr": [60.0, 55.0],
+         "Inv": [80.0, 70.0], "Rec": [90.0, 80.0]},
         columns=["26", "25"],
     )
 
@@ -234,12 +236,16 @@ def test_add_roce_matches_hand_computed_values():
     assert result.loc["ROCE", "26"] == 80.0  # 200/250*100
     assert result.loc["CapitalEmployedExCash", "26"] == 180.0  # 250-40-30
     assert result.loc["ROCEExCash", "26"] == pytest.approx(round(200 / 180 * 100, 2))
+    assert result.loc["NCAV", "26"] == 40.0  # 100-60
+    assert result.loc["NCAVCashInvRec", "26"] == 100.0  # (40+80+90)-(60+50)
 
     assert result.loc["WC", "25"] == 80.0  # 120-40
     assert result.loc["CapitalEmployed", "25"] == 210.0  # 90+15+25+80
     assert result.loc["ROCE", "25"] == pytest.approx(round(150 / 210 * 100, 2))
     assert result.loc["CapitalEmployedExCash", "25"] == 155.0  # 210-30-25
     assert result.loc["ROCEExCash", "25"] == pytest.approx(round(150 / 155 * 100, 2))
+    assert result.loc["NCAV", "25"] == 25.0  # 80-55
+    assert result.loc["NCAVCashInvRec", "25"] == 85.0  # (30+70+80)-(55+40)
 
     # Excluding cash can only raise (or leave unchanged) ROCE.
     assert result.loc["ROCEExCash", "26"] >= result.loc["ROCE", "26"]
@@ -456,6 +462,20 @@ def test_merge_market_data_no_market_sheet_gives_nan_columns_no_crash():
     assert pd.isna(result["PE"].iloc[0])
 
 
+def test_merge_market_data_zero_market_cap_is_treated_as_missing():
+    # A listed company can never have zero market cap -- this is a vendor
+    # data-export artifact, not a real value (observed in practice).
+    universe = pd.DataFrame({"Symbol": ["AAA"]})
+    sheets = {"Market": pd.DataFrame({
+        "Symbol": ["AAA"], "CMP": [641.05], "PE": [26.99], "Market cap (INR Cr)": [0.0],
+    })}
+
+    result = merge_market_data(universe, sheets)
+
+    assert pd.isna(result["Market Cap (Cr)"].iloc[0])
+    assert result["Price"].iloc[0] == 641.05  # Price/PE are untouched by this guard
+
+
 # --- build_universe_cache / cache ------------------------------------------------
 
 def test_build_universe_cache_returns_one_row_per_symbol_and_reports_progress():
@@ -501,7 +521,8 @@ def test_build_universe_cache_returns_one_row_per_symbol_and_reports_progress():
 
     expected_cols = {
         "Symbol", "Industry", "SSGR (%)", "Rev 10Y CAGR (%)", "SSGR Passes",
-        "Net 10Y CAGR (%)", "DebtEquity Latest (%)", "CFO Latest (Cr)",
+        "Net 10Y CAGR (%)", "DebtEquity Latest (%)", "CFO Latest (Cr)", "NCAV Latest (Cr)",
+        "NCAVCashInvRec Latest (Cr)",
     }
     rows_needed = {config["row"] for config in MOAT_METRIC_CONFIG.values()} | CCP_EXTRA_CACHE_ROWS
     expected_cols |= {f"{row} Y{y} (%)" for row in rows_needed for y in range(1, 11)}
@@ -721,6 +742,41 @@ def test_vijay_malik_passes_missing_value_is_na_unless_another_check_fails():
     assert pd.isna(combined.iloc[0])
 
 
+# --- net_net_passes -----------------------------------------------------------------
+
+def test_net_net_passes_mcap_below_ncav():
+    universe = pd.DataFrame({"Market Cap (Cr)": [100.0], "NCAV Latest (Cr)": [200.0]})
+    assert net_net_passes(universe, "NCAV Latest (Cr)").iloc[0] is True
+
+
+def test_net_net_passes_mcap_above_ncav():
+    universe = pd.DataFrame({"Market Cap (Cr)": [300.0], "NCAV Latest (Cr)": [200.0]})
+    assert net_net_passes(universe, "NCAV Latest (Cr)").iloc[0] is False
+
+
+def test_net_net_passes_negative_ncav_always_fails():
+    # Market Cap is always positive for a listed company, so it can never be
+    # below a negative NCAV — no separate "NCAV > 0" gate is needed.
+    universe = pd.DataFrame({"Market Cap (Cr)": [50.0], "NCAV Latest (Cr)": [-20.0]})
+    assert net_net_passes(universe, "NCAV Latest (Cr)").iloc[0] is False
+
+
+def test_net_net_passes_missing_value_is_na():
+    universe = pd.DataFrame({"Market Cap (Cr)": [float("nan")], "NCAV Latest (Cr)": [200.0]})
+    assert pd.isna(net_net_passes(universe, "NCAV Latest (Cr)").iloc[0])
+
+
+def test_net_net_passes_uses_the_given_ncav_column():
+    # Same Market Cap, different results depending on which NCAV basis is used.
+    universe = pd.DataFrame({
+        "Market Cap (Cr)": [150.0],
+        "NCAV Latest (Cr)": [200.0],
+        "NCAVCashInvRec Latest (Cr)": [100.0],
+    })
+    assert net_net_passes(universe, "NCAV Latest (Cr)").iloc[0] is True
+    assert net_net_passes(universe, "NCAVCashInvRec Latest (Cr)").iloc[0] is False
+
+
 # --- moat_score -------------------------------------------------------------------
 
 def test_moat_score_counts_true_only_and_treats_na_as_zero():
@@ -783,9 +839,9 @@ _COMFORTABLE_PASS_VALUES = {
 def make_universe_df(companies: list[dict]) -> pd.DataFrame:
     """Build a synthetic universe-cache-shaped DataFrame. Each company dict needs
     "Symbol"/"Industry", optionally "ssgr_pct"/"rev_cagr"/"ssgr_passes"/
-    "net_cagr"/"debt_equity"/"cfo"/"market_cap", and optionally a list of 10
-    values for any key in _COMFORTABLE_PASS_VALUES to override that row
-    (everything else defaults to a flat comfortable-pass value).
+    "net_cagr"/"debt_equity"/"cfo"/"market_cap"/"ncav"/"ncav_cash_inv_rec", and
+    optionally a list of 10 values for any key in _COMFORTABLE_PASS_VALUES to
+    override that row (everything else defaults to a flat comfortable-pass value).
     """
     records = []
     for company in companies:
@@ -799,6 +855,8 @@ def make_universe_df(companies: list[dict]) -> pd.DataFrame:
             "DebtEquity Latest (%)": company.get("debt_equity", 40.0),
             "CFO Latest (Cr)": company.get("cfo", 50.0),
             "Market Cap (Cr)": company.get("market_cap", 1000.0),
+            "NCAV Latest (Cr)": company.get("ncav", 2000.0),  # > Market Cap default (1000.0), so Net-Net passes
+            "NCAVCashInvRec Latest (Cr)": company.get("ncav_cash_inv_rec", 2000.0),
         }
         for row, default_val in _COMFORTABLE_PASS_VALUES.items():
             values = company.get(row, [default_val] * 10)
@@ -812,6 +870,7 @@ def _default_overrides() -> dict:
     overrides = {key: {"use_industry": True, "manual": cfg["default"]} for key, cfg in MOAT_METRIC_CONFIG.items()}
     overrides["ccp"] = {"roce": 15, "growth": 10, "years": 10}
     overrides["vijay_malik"] = {"sales_cagr": 15, "net_cagr": 30, "debt_equity": 100, "cfo": 0, "market_cap": 500}
+    overrides["net_net"] = {"min_mcap": 0.0}
     return overrides
 
 
@@ -822,7 +881,7 @@ def test_evaluate_screens_for_company_all_pass():
 
     result = evaluate_screens_for_company(universe, "PASSER", _default_overrides())
 
-    assert len(result) == 15  # SSGR + 7 moats + 4 nalanda + 2 ccp + vijay malik
+    assert len(result) == 17  # SSGR + 7 moats + 4 nalanda + 2 ccp + vijay malik + 2 net-net
     assert (result["Passes"] == True).all()  # noqa: E712
     assert (result["Detail"] == "—").all()
 
@@ -893,11 +952,42 @@ def test_evaluate_screens_for_company_vijay_malik_missing_data_is_not_enough():
     assert vm_row["Detail"] == "not enough data"
 
 
+def test_evaluate_screens_for_company_net_net_fails_when_mcap_above_ncav():
+    universe = make_universe_df([
+        {"Symbol": "PRICEY", "Industry": "Ind X", "market_cap": 3000.0, "ncav": 2000.0, "ncav_cash_inv_rec": 2500.0},
+    ])
+
+    result = evaluate_screens_for_company(universe, "PRICEY", _default_overrides())
+
+    full_row = result[result["Filter"] == "Net-Net – Full Current Assets"].iloc[0]
+    assert full_row["Passes"] == False  # noqa: E712 (a homogeneous True/False column may be bool dtype, not object)
+    assert "3000.00" in full_row["Detail"]
+    assert "2000.00" in full_row["Detail"]
+
+    quick_row = result[result["Filter"] == "Net-Net – Cash+Inv+Rec"].iloc[0]
+    assert quick_row["Passes"] == False  # noqa: E712
+    assert "2500.00" in quick_row["Detail"]
+
+
+def test_evaluate_screens_for_company_net_net_market_cap_floor():
+    # Clears Mcap < NCAV comfortably, but Market Cap is below the configured floor.
+    universe = make_universe_df([{"Symbol": "TOOSMALL", "Industry": "Ind X"}])
+    overrides = _default_overrides()
+    overrides["net_net"] = {"min_mcap": 5000.0}  # default Market Cap (1000.0) is below this
+
+    result = evaluate_screens_for_company(universe, "TOOSMALL", overrides)
+
+    full_row = result[result["Filter"] == "Net-Net – Full Current Assets"].iloc[0]
+    assert full_row["Passes"] == False  # noqa: E712
+    assert "floor" in full_row["Detail"]
+    assert "5000.00" in full_row["Detail"]
+
+
 def test_evaluate_screens_for_company_symbol_not_in_universe():
     universe = make_universe_df([{"Symbol": "PASSER", "Industry": "Ind X"}])
 
     result = evaluate_screens_for_company(universe, "NOT_THERE", _default_overrides())
 
-    assert len(result) == 15
+    assert len(result) == 17
     assert result["Passes"].isna().all()
     assert (result["Detail"] == "not in Screens cache — click Refresh on the Screens page").all()

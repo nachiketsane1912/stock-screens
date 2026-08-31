@@ -8,8 +8,13 @@ A Streamlit app for exploring the fundamentals of a universe of stocks (quarterl
 - **Screens** — run the same metrics across the entire universe of companies:
   - **SSGR** — Self-Sustainable Growth Rate vs. 10-year revenue CAGR (did the company grow organically, without needing external capital?).
   - **Moats** — 7 quality screens (Operating Margin, Net Margin, Interest/Operating Profit, Capex/Revenue, Capex/Net Income, Liabilities/Equity, ROE), each checked for consistency over the last 10 fiscal years, with a combined 0–7 score and ranking.
-  - **Nalanda's F** — 4 ROCE-based filters (ROCE and ROCE excluding excess cash, each checked as a 10-year median and as an every-year-of-10 bar), against a manual threshold.
-  - Moats thresholds default to your own industry peers' percentile, with a manual override slider; Nalanda's F uses a manual threshold only (no industry-relative option). Click any row in a results table to jump straight to that company in the Data Explorer.
+  - **Nalanda's F** — 4 ROCE-based filters (ROCE and ROCE excluding excess cash and investments, each checked as a 10-year median and as an every-year-of-10 bar), against a manual threshold.
+  - **CCP (Coffee Can Portfolio)** — ROCE (regular and excluding excess cash) AND revenue growth, both above a bar every year for a configurable number of years. Two lists, fixed absolute thresholds.
+  - **Vijay Malik** — a 5-parameter checklist: Sales CAGR, Net Profit CAGR (both 10-year), Debt/Equity and CFO (latest year), and Market Cap — all 5 must pass.
+  - **Net-Net** — Benjamin Graham's screen: Market Cap below Net Current Asset Value (current assets minus total liabilities excluding equity). Two lists (one using all current assets, one using only Cash + Inventory + Receivables) sharing a configurable minimum Market Cap floor — sorted by biggest discount to NCAV first.
+  - Moats thresholds default to your own industry peers' percentile, with a manual override slider; every other screen uses fixed/manual thresholds only (no industry-relative option). Click any row in a results table to jump straight to that company in the Data Explorer.
+  - **Data Explorer** also shows a **Filters** section: every screen's pass/fail verdict for the one company you're viewing, with the specific reason for any failure.
+  - An optional **Market** sheet (see below) supplies live Price/P·E/Market Cap, used by the Vijay Malik and Net-Net screens and shown on the Data Explorer page.
 
 ## Getting started
 
@@ -119,7 +124,7 @@ app.py                    # multipage entrypoint (navigation only)
 data_loader.py             # all data loading, reshaping, and derived-metric/screen logic
 pages/
   data_explorer.py          # per-company exploration page
-  screens.py                 # universe-wide screens page (SSGR, Moats, Nalanda's F)
+  screens.py                 # universe-wide screens page (SSGR, Moats, Nalanda's F, CCP, Vijay Malik, Net-Net)
 tests/
   test_data_loader.py        # unit + integration tests, using hand-built synthetic sheets
 requirements.txt
