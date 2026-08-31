@@ -91,6 +91,9 @@ if symbol:
             "min_threshold": vantage_min_threshold,
             "max_threshold": vantage_max_threshold,
         }
+        overrides["magic_formula"] = {
+            "min_market_cap": st.session_state.get("magic_formula_min_market_cap_saved", 0.0),
+        }
         st.dataframe(
             evaluate_screens_for_company(universe, symbol, overrides), use_container_width=True, hide_index=True
         )

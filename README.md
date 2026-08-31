@@ -13,6 +13,7 @@ A Streamlit app for exploring the fundamentals of a universe of stocks (quarterl
   - **Vijay Malik** — a 5-parameter checklist: Sales CAGR, Net Profit CAGR (both 10-year), Debt/Equity and CFO (latest year), and Market Cap — all 5 must pass.
   - **Net-Net** — Benjamin Graham's screen: Market Cap below Net Current Asset Value (current assets minus total liabilities excluding equity). Two lists (one using all current assets, one using only Cash + Inventory + Receivables) sharing a configurable minimum Market Cap floor — sorted by biggest discount to NCAV first.
   - **Vantage** — Sanjay Bakshi's banker's-valuation screen: a decay-weighted 10-year average of CFO and Interest gives a Cashflow, a third of which (Interest Serviceable) divided by a configurable lending rate gives the Loan a banker would extend; adding Cash gives Total Value. Passes when Market Cap / Total Value falls in a configurable range (default 0 to 1) — the lower bound rules out companies whose Loan capacity has gone negative (Loan swamps Cash) from ever looking "cheap."
+  - **Magic Formula** — Joel Greenblatt's rank-and-sum screen: companies are ranked by Earnings Yield (PBIT / Enterprise Value) and by Return on Capital (PBIT / (Net Block + Working Capital)), the two ranks are added together, and that sum is ranked again to surface the top 10. Two lists (Working Capital with vs. without cash) sharing a configurable minimum Market Cap floor, applied before ranking.
   - Moats thresholds default to your own industry peers' percentile, with a manual override slider; every other screen uses fixed/manual thresholds only (no industry-relative option). Click any row in a results table to jump straight to that company in the Data Explorer.
   - **Data Explorer** also shows a **Filters** section: every screen's pass/fail verdict for the one company you're viewing, with the specific reason for any failure.
   - An optional **Market** sheet (see below) supplies live Price/P·E/Market Cap, used by the Vijay Malik and Net-Net screens and shown on the Data Explorer page.
@@ -125,7 +126,7 @@ app.py                    # multipage entrypoint (navigation only)
 data_loader.py             # all data loading, reshaping, and derived-metric/screen logic
 pages/
   data_explorer.py          # per-company exploration page
-  screens.py                 # universe-wide screens page (SSGR, Moats, Nalanda's F, CCP, Vijay Malik, Net-Net, Vantage)
+  screens.py                 # universe-wide screens page (SSGR, Moats, Nalanda's F, CCP, Vijay Malik, Net-Net, Vantage, Magic Formula)
 tests/
   test_data_loader.py        # unit + integration tests, using hand-built synthetic sheets
 requirements.txt

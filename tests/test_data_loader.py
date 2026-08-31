@@ -23,6 +23,7 @@ from data_loader import (
     get_company_view,
     industry_metric_thresholds,
     load_universe_cache,
+    magic_formula_ranking,
     merge_market_data,
     metric_moat_passes,
     moat_score,
@@ -209,6 +210,7 @@ def test_add_capex_and_ratios_matches_hand_computed_values():
     assert result.loc["LiabEquity", "26"] == 40.0  # (150+50)/500*100
     assert result.loc["ROE", "26"] == 30.0  # 150/500*100
     assert result.loc["DebtEquity", "26"] == 30.0  # 150/500*100 (Borr alone, no OL)
+    assert result.loc["TotalLiabExEquity", "26"] == 200.0  # 150+50
 
     # Oldest year: Capex undefined (no earlier year), but LowDebt/LiabEquity/ROE
     # don't depend on Capex, so they're still computed.
@@ -219,6 +221,7 @@ def test_add_capex_and_ratios_matches_hand_computed_values():
     assert result.loc["LiabEquity", "25"] == pytest.approx(round(185 / 450 * 100, 2))
     assert result.loc["ROE", "25"] == pytest.approx(round(120 / 450 * 100, 2))
     assert result.loc["DebtEquity", "25"] == pytest.approx(round(140 / 450 * 100, 2))
+    assert result.loc["TotalLiabExEquity", "25"] == 185.0  # 140+45
 
 
 # --- add_roce ------------------------------------------------------------------------
@@ -241,6 +244,8 @@ def test_add_roce_matches_hand_computed_values():
     assert result.loc["ROCEExCash", "26"] == pytest.approx(round(200 / 180 * 100, 2))
     assert result.loc["NCAV", "26"] == 40.0  # 100-60
     assert result.loc["NCAVCashInvRec", "26"] == 100.0  # (40+80+90)-(60+50)
+    assert result.loc["MagicROC", "26"] == 100.0  # 200/(100+100)*100
+    assert result.loc["MagicROCExCash", "26"] == 125.0  # 200/(100+100-40)*100
 
     assert result.loc["WC", "25"] == 80.0  # 120-40
     assert result.loc["CapitalEmployed", "25"] == 210.0  # 90+15+25+80
@@ -249,6 +254,8 @@ def test_add_roce_matches_hand_computed_values():
     assert result.loc["ROCEExCash", "25"] == pytest.approx(round(150 / 155 * 100, 2))
     assert result.loc["NCAV", "25"] == 25.0  # 80-55
     assert result.loc["NCAVCashInvRec", "25"] == 85.0  # (30+70+80)-(55+40)
+    assert result.loc["MagicROC", "25"] == pytest.approx(round(150 / (90 + 80) * 100, 2))
+    assert result.loc["MagicROCExCash", "25"] == pytest.approx(round(150 / (90 + 80 - 30) * 100, 2))
 
     # Excluding cash can only raise (or leave unchanged) ROCE.
     assert result.loc["ROCEExCash", "26"] >= result.loc["ROCE", "26"]
@@ -526,6 +533,7 @@ def test_build_universe_cache_returns_one_row_per_symbol_and_reports_progress():
         "Symbol", "Industry", "SSGR (%)", "Rev 10Y CAGR (%)", "SSGR Passes",
         "Net 10Y CAGR (%)", "DebtEquity Latest (%)", "CFO Latest (Cr)", "NCAV Latest (Cr)",
         "NCAVCashInvRec Latest (Cr)", "Cash Latest (Cr)",
+        "PBIT Latest (Cr)", "TotalLiabExEquity Latest (Cr)", "MagicROC Latest (%)", "MagicROCExCash Latest (%)",
     }
     expected_cols |= {f"Int Y{y} (Cr)" for y in range(1, 11)} | {f"CFO Y{y} (Cr)" for y in range(1, 11)}
     rows_needed = {config["row"] for config in MOAT_METRIC_CONFIG.values()} | CCP_EXTRA_CACHE_ROWS
@@ -855,6 +863,72 @@ def test_company_vantage_metrics_matches_hand_computed_values():
     assert result["multiple"] == pytest.approx(0.5)  # 850/1700
 
 
+# --- magic_formula_ranking -----------------------------------------------------------
+
+def _magic_formula_universe(companies: dict) -> pd.DataFrame:
+    """companies: {Symbol: {"market_cap":, "total_liab_ex_equity":, "pbit":, "roc":}}."""
+    rows = []
+    for symbol, c in companies.items():
+        rows.append({
+            "Symbol": symbol,
+            "Industry": "Ind X",
+            "Market Cap (Cr)": c["market_cap"],
+            "TotalLiabExEquity Latest (Cr)": c["total_liab_ex_equity"],
+            "PBIT Latest (Cr)": c["pbit"],
+            "MagicROC Latest (%)": c["roc"],
+        })
+    return pd.DataFrame(rows)
+
+
+def test_magic_formula_ranking_matches_hand_computed_ranks():
+    # EV all = 1000 for A/C (TotalLiabExEquity 0/500), 2000 for B.
+    universe = _magic_formula_universe({
+        "A": {"market_cap": 1000.0, "total_liab_ex_equity": 0.0, "pbit": 200.0, "roc": 50.0},   # EY=20%, ROC=50%
+        "B": {"market_cap": 2000.0, "total_liab_ex_equity": 0.0, "pbit": 200.0, "roc": 40.0},   # EY=10%, ROC=40%
+        "C": {"market_cap": 500.0, "total_liab_ex_equity": 500.0, "pbit": 150.0, "roc": 30.0},  # EY=15%, ROC=30%
+    })
+
+    result = magic_formula_ranking(universe, "MagicROC Latest (%)", min_market_cap=0.0)
+    by_symbol = result.set_index("Symbol")
+
+    assert by_symbol.loc["A", "Earnings Yield (%)"] == 20.0
+    assert by_symbol.loc["B", "Earnings Yield (%)"] == 10.0
+    assert by_symbol.loc["C", "Earnings Yield (%)"] == 15.0
+
+    # EY ranks (desc): A=1, C=2, B=3. ROC ranks (desc): A=1, B=2, C=3.
+    assert by_symbol.loc["A", "Total Rank"] == 2.0  # 1+1
+    assert by_symbol.loc["B", "Total Rank"] == 5.0  # 3+2
+    assert by_symbol.loc["C", "Total Rank"] == 5.0  # 2+3
+
+    assert by_symbol.loc["A", "Magic Rank"] == 1.0
+    assert by_symbol.loc["B", "Magic Rank"] == 2.0  # tied with C, method="min"
+    assert by_symbol.loc["C", "Magic Rank"] == 2.0
+
+
+def test_magic_formula_ranking_market_cap_floor_excludes_company():
+    universe = _magic_formula_universe({
+        "BIG": {"market_cap": 1000.0, "total_liab_ex_equity": 0.0, "pbit": 100.0, "roc": 20.0},
+        "TINY": {"market_cap": 50.0, "total_liab_ex_equity": 0.0, "pbit": 10.0, "roc": 20.0},
+    })
+
+    result = magic_formula_ranking(universe, "MagicROC Latest (%)", min_market_cap=100.0)
+
+    assert list(result["Symbol"]) == ["BIG"]
+    assert result.set_index("Symbol").loc["BIG", "Magic Rank"] == 1.0
+
+
+def test_magic_formula_ranking_missing_roc_excludes_company_only():
+    universe = _magic_formula_universe({
+        "OK": {"market_cap": 1000.0, "total_liab_ex_equity": 0.0, "pbit": 100.0, "roc": 20.0},
+        "NODATA": {"market_cap": 1000.0, "total_liab_ex_equity": 0.0, "pbit": 100.0, "roc": float("nan")},
+    })
+
+    result = magic_formula_ranking(universe, "MagicROC Latest (%)", min_market_cap=0.0)
+
+    assert list(result["Symbol"]) == ["OK"]
+    assert result.set_index("Symbol").loc["OK", "Magic Rank"] == 1.0
+
+
 # --- moat_score -------------------------------------------------------------------
 
 def test_moat_score_counts_true_only_and_treats_na_as_zero():
@@ -918,9 +992,10 @@ def make_universe_df(companies: list[dict]) -> pd.DataFrame:
     """Build a synthetic universe-cache-shaped DataFrame. Each company dict needs
     "Symbol"/"Industry", optionally "ssgr_pct"/"rev_cagr"/"ssgr_passes"/
     "net_cagr"/"debt_equity"/"cfo"/"market_cap"/"ncav"/"ncav_cash_inv_rec"/
-    "cash_latest"/"vantage_cfo"/"vantage_int" (the last two as 10-value lists),
-    and optionally a list of 10 values for any key in _COMFORTABLE_PASS_VALUES
-    to override that row (everything else defaults to a flat comfortable-pass value).
+    "cash_latest"/"vantage_cfo"/"vantage_int" (the last two as 10-value lists)/
+    "pbit"/"total_liab_ex_equity"/"magic_roc"/"magic_roc_ex_cash", and optionally
+    a list of 10 values for any key in _COMFORTABLE_PASS_VALUES to override that
+    row (everything else defaults to a flat comfortable-pass value).
     """
     records = []
     for company in companies:
@@ -940,6 +1015,13 @@ def make_universe_df(companies: list[dict]) -> pd.DataFrame:
             # Loan=1500 (at the default 10% rate), TotalValue=1700 -> Multiple ~0.59
             # (comfortably inside the default 0..1 Vantage pass range vs. Market Cap 1000.0).
             "Cash Latest (Cr)": company.get("cash_latest", 200.0),
+            # Magic Formula: PBIT=200, TotalLiabExEquity=300 -> EV=1300, EY~15.38%;
+            # MagicROC/ExCash are just non-NaN placeholders — with only one company
+            # in these fixtures it's always rank #1 as long as it's not excluded.
+            "PBIT Latest (Cr)": company.get("pbit", 200.0),
+            "TotalLiabExEquity Latest (Cr)": company.get("total_liab_ex_equity", 300.0),
+            "MagicROC Latest (%)": company.get("magic_roc", 25.0),
+            "MagicROCExCash Latest (%)": company.get("magic_roc_ex_cash", 30.0),
         }
         vantage_cfo = company.get("vantage_cfo", [500.0] * 10)
         vantage_int = company.get("vantage_int", [50.0] * 10)
@@ -960,6 +1042,7 @@ def _default_overrides() -> dict:
     overrides["vijay_malik"] = {"sales_cagr": 15, "net_cagr": 30, "debt_equity": 100, "cfo": 0, "market_cap": 500}
     overrides["net_net"] = {"min_mcap": 0.0}
     overrides["vantage"] = {"decay": 0.85, "rate": 0.10, "min_threshold": 0.0, "max_threshold": 1.0}
+    overrides["magic_formula"] = {"min_market_cap": 0.0}
     return overrides
 
 
@@ -970,7 +1053,7 @@ def test_evaluate_screens_for_company_all_pass():
 
     result = evaluate_screens_for_company(universe, "PASSER", _default_overrides())
 
-    assert len(result) == 18  # SSGR + 7 moats + 4 nalanda + 2 ccp + vijay malik + 2 net-net + vantage
+    assert len(result) == 20  # SSGR + 7 moats + 4 nalanda + 2 ccp + vijay malik + 2 net-net + vantage + 2 magic formula
     assert (result["Passes"] == True).all()  # noqa: E712
     assert (result["Detail"] == "—").all()
 
@@ -1110,11 +1193,39 @@ def test_evaluate_screens_for_company_vantage_missing_year_is_not_enough_data():
     assert vantage_row["Detail"] == "not enough data"
 
 
+def test_evaluate_screens_for_company_magic_formula_outside_top_10():
+    # 10 companies with a strong, identical PBIT (so they all out-rank the 11th
+    # on Earnings Yield) plus one much weaker company that should rank last.
+    companies = [{"Symbol": f"C{i}", "Industry": "Ind X", "pbit": 1000.0} for i in range(1, 11)]
+    companies.append({"Symbol": "WORST", "Industry": "Ind X", "pbit": 1.0})
+    universe = make_universe_df(companies)
+
+    result = evaluate_screens_for_company(universe, "WORST", _default_overrides())
+
+    row = result[result["Filter"] == "Magic Formula – Plain WC"].iloc[0]
+    assert row["Passes"] == False  # noqa: E712 (a homogeneous True/False column may be bool dtype, not object)
+    assert "outside the top 10" in row["Detail"]
+    assert "#11" in row["Detail"]
+
+
+def test_evaluate_screens_for_company_magic_formula_market_cap_floor():
+    universe = make_universe_df([{"Symbol": "TOOSMALL", "Industry": "Ind X", "market_cap": 50.0}])
+    overrides = _default_overrides()
+    overrides["magic_formula"] = {"min_market_cap": 100.0}
+
+    result = evaluate_screens_for_company(universe, "TOOSMALL", overrides)
+
+    row = result[result["Filter"] == "Magic Formula – Plain WC"].iloc[0]
+    assert pd.isna(row["Passes"])
+    assert "floor" in row["Detail"]
+    assert "100.00" in row["Detail"]
+
+
 def test_evaluate_screens_for_company_symbol_not_in_universe():
     universe = make_universe_df([{"Symbol": "PASSER", "Industry": "Ind X"}])
 
     result = evaluate_screens_for_company(universe, "NOT_THERE", _default_overrides())
 
-    assert len(result) == 18
+    assert len(result) == 20
     assert result["Passes"].isna().all()
     assert (result["Detail"] == "not in Screens cache — click Refresh on the Screens page").all()

@@ -271,8 +271,9 @@ def add_ssgr(is_table: pd.DataFrame, bs_table: pd.DataFrame) -> pd.DataFrame:
 
 
 def add_capex_and_ratios(is_table: pd.DataFrame, bs_table: pd.DataFrame) -> pd.DataFrame:
-    """Add NetWorth, Capex, LowCapex, LowDebt, CapexNI, LiabEquity and ROE rows
-    to an IS metric table (annual only, like add_ssgr).
+    """Add NetWorth, Capex, LowCapex, LowDebt, CapexNI, LiabEquity, ROE,
+    DebtEquity and TotalLiabExEquity rows to an IS metric table (annual only,
+    like add_ssgr).
 
     NetWorth = Eq + Res (Equity Capital + Reserves — the standard "Equity" in
                Debt/Equity and ROE ratios)
@@ -286,6 +287,8 @@ def add_capex_and_ratios(is_table: pd.DataFrame, bs_table: pd.DataFrame) -> pd.D
     ROE = Net / NetWorth * 100
     DebtEquity = Borr / NetWorth * 100   (borrowings only, unlike LiabEquity's
         Borr + OL — this is the textbook "Debt/Equity", used by the Vijay Malik screen)
+    TotalLiabExEquity = Borr + OL   (the same quantity as LiabEquity's numerator,
+        exposed directly — used as part of Enterprise Value in the Magic Formula screen)
     """
     if is_table.empty or bs_table.empty:
         return is_table
@@ -312,13 +315,14 @@ def add_capex_and_ratios(is_table: pd.DataFrame, bs_table: pd.DataFrame) -> pd.D
     is_table.loc["LiabEquity"] = (_safe_divide(borr_ol, net_worth) * 100).round(2)
     is_table.loc["ROE"] = (_safe_divide(net, net_worth) * 100).round(2)
     is_table.loc["DebtEquity"] = (_safe_divide(borr, net_worth) * 100).round(2)
+    is_table.loc["TotalLiabExEquity"] = borr_ol.round(2)
 
     return is_table
 
 
 def add_roce(is_table: pd.DataFrame, bs_table: pd.DataFrame) -> pd.DataFrame:
-    """Add WC, CapitalEmployed, ROCE, CapitalEmployedExCash, ROCEExCash, NCAV
-    and NCAVCashInvRec rows to an IS table (annual only).
+    """Add WC, CapitalEmployed, ROCE, CapitalEmployedExCash, ROCEExCash, NCAV,
+    NCAVCashInvRec, MagicROC and MagicROCExCash rows to an IS table (annual only).
 
     WC = OA - OL   (the workbook has no granular Current Assets/Liabilities
          split, so this reuses the same OA/OL aggregates as add_bs_totals/
@@ -335,6 +339,12 @@ def add_roce(is_table: pd.DataFrame, bs_table: pd.DataFrame) -> pd.DataFrame:
     NCAVCashInvRec = (Cash + Inv + Rec) - (Borr + OL)   (a more conservative
         net-net basis: only cash, inventory and receivables count as "current
         assets", not all of OA's other current-asset odds and ends)
+    MagicROC = PBIT / (NB + WC) * 100   (Joel Greenblatt's "Magic Formula"
+        Return on Capital — a different, smaller capital base than ROCE's,
+        with no WIP/Invest term at all)
+    MagicROCExCash = PBIT / (NB + WC - Cash) * 100   (excludes only Cash —
+        Invest was never part of this capital base to begin with, unlike
+        ROCEExCash's CapitalEmployed, so there's nothing else to exclude)
     """
     if is_table.empty or bs_table.empty:
         return is_table
@@ -362,6 +372,8 @@ def add_roce(is_table: pd.DataFrame, bs_table: pd.DataFrame) -> pd.DataFrame:
     is_table.loc["ROCEExCash"] = (_safe_divide(pbit, capital_employed_ex_cash) * 100).round(2)
     is_table.loc["NCAV"] = (wc - borr).round(2)
     is_table.loc["NCAVCashInvRec"] = ((cash + inv + rec) - (borr + ol)).round(2)
+    is_table.loc["MagicROC"] = (_safe_divide(pbit, nb + wc) * 100).round(2)
+    is_table.loc["MagicROCExCash"] = (_safe_divide(pbit, nb + wc - cash) * 100).round(2)
 
     return is_table
 
@@ -540,13 +552,15 @@ def build_universe_cache(
     fewer than 10 years exist. Also includes single-scalar columns for the
     Vijay Malik screen (`Net 10Y CAGR (%)`, `DebtEquity Latest (%)`, `CFO
     Latest (Cr)`), the Net-Net screen (`NCAV Latest (Cr)`, `NCAVCashInvRec
-    Latest (Cr)` — the two asset bases) and the Vantage screen (`Cash Latest
+    Latest (Cr)` — the two asset bases), the Vantage screen (`Cash Latest
     (Cr)`, plus `Int Y1 (Cr)`..`Int Y10 (Cr)` and `CFO Y1 (Cr)`..`CFO Y10
     (Cr)` — a 10-year raw series, not a precomputed average, since Vantage's
     year-weighting is user-adjustable and must be recomputable instantly on
-    every rerun) — all are the latest completed fiscal year's value or a raw
+    every rerun), and the Magic Formula screen (`PBIT Latest (Cr)`,
+    `TotalLiabExEquity Latest (Cr)`, `MagicROC Latest (%)`, `MagicROCExCash
+    Latest (%)`) — all are the latest completed fiscal year's value or a raw
     10-year series, not a fixed consistency bar, since these screens check a
-    balance-sheet snapshot or a configurable weighted average.
+    balance-sheet snapshot or a configurable weighted average/ranking.
     Price/P·E/Market Cap are *not* here — `merge_market_data()` reads those
     straight from the `Market` sheet on every page load instead, since Price
     changes far more often than fundamentals do.
@@ -580,6 +594,14 @@ def build_universe_cache(
             if "NCAVCashInvRec" in income_statement.index and annual_cols else float("nan"),
             "Cash Latest (Cr)": balance_sheet.loc["Cash", annual_bs_cols[0]]
             if "Cash" in balance_sheet.index and annual_bs_cols else float("nan"),
+            "PBIT Latest (Cr)": income_statement.loc["PBIT", annual_cols[0]]
+            if "PBIT" in income_statement.index and annual_cols else float("nan"),
+            "TotalLiabExEquity Latest (Cr)": income_statement.loc["TotalLiabExEquity", annual_cols[0]]
+            if "TotalLiabExEquity" in income_statement.index and annual_cols else float("nan"),
+            "MagicROC Latest (%)": income_statement.loc["MagicROC", annual_cols[0]]
+            if "MagicROC" in income_statement.index and annual_cols else float("nan"),
+            "MagicROCExCash Latest (%)": income_statement.loc["MagicROCExCash", annual_cols[0]]
+            if "MagicROCExCash" in income_statement.index and annual_cols else float("nan"),
         }
         for is_row in rows_needed:
             row_values = _numeric_row(income_statement, is_row)
@@ -873,6 +895,51 @@ def company_vantage_metrics(
     }
 
 
+def magic_formula_ranking(universe: pd.DataFrame, roc_column: str, min_market_cap: float) -> pd.DataFrame:
+    """Joel Greenblatt's "Magic Formula": rank companies by Earnings Yield and
+    by Return on Capital, sum the two ranks into a Total Rank, then rank that
+    sum into a Magic Rank (1 = best). Returns every eligible/ranked company,
+    sorted by Magic Rank — callers `.head(10)` for the usual "top 10" display;
+    a single company's row can also be looked up directly to report its rank
+    even when it falls outside the top 10.
+
+    EV (Enterprise Value) = Market Cap (Cr) + TotalLiabExEquity Latest (Cr)
+        (Borr + OL — the same "liabilities excluding equity" basis established
+        for the Net-Net screen; adding liabilities *including* equity would
+        double-count equity, since Market Cap already prices it)
+    Earnings Yield (%) = PBIT Latest (Cr) / EV * 100
+    ROC (%) = `roc_column` ("MagicROC Latest (%)" or "MagicROCExCash Latest (%)")
+
+    `min_market_cap` is a pre-filter on the *eligible universe*, not a
+    post-hoc filter on the results — companies below it are excluded before
+    ranks are computed at all, so they can't affect anyone else's rank
+    either (standard Magic Formula practice). A company missing Earnings
+    Yield or the chosen ROC (e.g. non-positive EV or capital base) is
+    likewise excluded — a NaN can't be meaningfully ranked. Requires
+    `universe` to already have `Market Cap (Cr)` (i.e., called after
+    merge_market_data()).
+    """
+    mcap = pd.to_numeric(universe["Market Cap (Cr)"], errors="coerce")
+    eligible = universe[mcap > min_market_cap].copy()
+
+    ev = pd.to_numeric(eligible["Market Cap (Cr)"], errors="coerce") + pd.to_numeric(
+        eligible["TotalLiabExEquity Latest (Cr)"], errors="coerce"
+    )
+    pbit = pd.to_numeric(eligible["PBIT Latest (Cr)"], errors="coerce")
+    roc = pd.to_numeric(eligible[roc_column], errors="coerce")
+
+    eligible["Earnings Yield (%)"] = (_safe_divide(pbit, ev) * 100).round(2)
+    eligible["ROC (%)"] = roc.round(2)
+
+    ranked = eligible.dropna(subset=["Earnings Yield (%)", "ROC (%)"]).copy()
+    ranked["EY Rank"] = ranked["Earnings Yield (%)"].rank(ascending=False)
+    ranked["ROC Rank"] = ranked["ROC (%)"].rank(ascending=False)
+    ranked["Total Rank"] = ranked["EY Rank"] + ranked["ROC Rank"]
+    ranked["Magic Rank"] = ranked["Total Rank"].rank(ascending=True, method="min")
+
+    return ranked.sort_values("Magic Rank")
+
+
 def and_tri_state(a: pd.Series, b: pd.Series) -> pd.Series:
     """Three-valued AND of two tri-state (True/False/pd.NA) Series: False
     dominates (even over the other side's NA, since AND-ing with a definite
@@ -918,19 +985,22 @@ def failure_detail(values: pd.Series, threshold: float, direction: str, consiste
 
 def evaluate_screens_for_company(universe: pd.DataFrame, symbol: str, overrides: dict) -> pd.DataFrame:
     """Evaluate every screen (SSGR, all MOAT_METRIC_CONFIG entries, the 2 CCP
-    lists, Vijay Malik, the 2 Net-Net lists, and Vantage) for one company,
-    using the same formulas `pages/screens.py` uses for the whole universe.
-    `overrides` (resolved by the caller from st.session_state, kept out of
-    this function to stay UI-free): {config_key: {"use_industry": bool,
-    "manual": float}} for every MOAT_METRIC_CONFIG key, plus "ccp": {"roce":
-    float, "growth": float, "years": int}, "vijay_malik": {check["key"]:
-    float, ...} for each of VIJAY_MALIK_CHECKS, "net_net": {"min_mcap": float}
-    (the shared Market Cap floor both Net-Net lists apply on top of their own
-    Mcap<NCAV comparison — mirrors how CCP's two ROCE variants share one
-    revenue-growth check), and "vantage": {"decay": float, "rate": float,
-    "min_threshold": float, "max_threshold": float}. Returns one row per
-    screen: Filter, Group, Passes (True/False/pd.NA), Detail ("—" if passing,
-    "not enough history"/"not enough data" if NA, else a failure explanation).
+    lists, Vijay Malik, the 2 Net-Net lists, Vantage, and the 2 Magic Formula
+    rankings) for one company, using the same formulas `pages/screens.py`
+    uses for the whole universe. `overrides` (resolved by the caller from
+    st.session_state, kept out of this function to stay UI-free):
+    {config_key: {"use_industry": bool, "manual": float}} for every
+    MOAT_METRIC_CONFIG key, plus "ccp": {"roce": float, "growth": float,
+    "years": int}, "vijay_malik": {check["key"]: float, ...} for each of
+    VIJAY_MALIK_CHECKS, "net_net": {"min_mcap": float} (the shared Market Cap
+    floor both Net-Net lists apply on top of their own Mcap<NCAV comparison —
+    mirrors how CCP's two ROCE variants share one revenue-growth check),
+    "vantage": {"decay": float, "rate": float, "min_threshold": float,
+    "max_threshold": float}, and "magic_formula": {"min_market_cap": float}
+    (the pre-ranking eligibility floor shared by both Magic Formula rankings).
+    Returns one row per screen: Filter, Group, Passes (True/False/pd.NA),
+    Detail ("—" if passing, "not enough history"/"not enough data" if NA,
+    else a failure explanation).
     """
     columns = ["Filter", "Group", "Passes", "Detail"]
     match = universe.loc[universe["Symbol"] == symbol]
@@ -942,6 +1012,7 @@ def evaluate_screens_for_company(universe: pd.DataFrame, symbol: str, overrides:
             + [("CCP – Regular ROCE", "CCP"), ("CCP – Nalanda's F", "CCP"), ("Vijay Malik", "Vijay Malik")]
             + [("Net-Net – Full Current Assets", "Net-Net"), ("Net-Net – Cash+Inv+Rec", "Net-Net")]
             + [("Vantage", "Vantage")]
+            + [("Magic Formula – Plain WC", "Magic Formula"), ("Magic Formula – Ex Cash", "Magic Formula")]
         ]
         return pd.DataFrame(rows, columns=columns)
 
@@ -1097,6 +1168,36 @@ def evaluate_screens_for_company(universe: pd.DataFrame, symbol: str, overrides:
         vantage_detail = "; ".join(reasons) if reasons else "not enough data"
 
     rows.append(("Vantage", "Vantage", vantage_passes, vantage_detail))
+
+    magic_formula_overrides = overrides.get("magic_formula", {})
+    min_market_cap = magic_formula_overrides.get("min_market_cap", 0.0)
+
+    for label, roc_column in [
+        ("Magic Formula – Plain WC", "MagicROC Latest (%)"),
+        ("Magic Formula – Ex Cash", "MagicROCExCash Latest (%)"),
+    ]:
+        ranked = magic_formula_ranking(universe, roc_column, min_market_cap)
+
+        if idx in ranked.index:
+            magic_rank = ranked.loc[idx, "Magic Rank"]
+            if magic_rank <= 10:
+                mf_passes, mf_detail = True, "—"
+            else:
+                ey_val, roc_val = ranked.loc[idx, "Earnings Yield (%)"], ranked.loc[idx, "ROC (%)"]
+                mf_passes = False
+                mf_detail = (
+                    f"Ranked #{int(magic_rank)} of {len(ranked)} (EY {ey_val:.2f}%, ROC {roc_val:.2f}%) "
+                    "— outside the top 10"
+                )
+        else:
+            mf_passes = pd.NA
+            mcap_val = pd.to_numeric(pd.Series([urow["Market Cap (Cr)"]]), errors="coerce").iloc[0]
+            if pd.notna(mcap_val) and mcap_val <= min_market_cap:
+                mf_detail = f"Market Cap ₹{mcap_val:.2f} Cr is not above the floor ₹{min_market_cap:.2f} Cr"
+            else:
+                mf_detail = "not enough data"
+
+        rows.append((label, "Magic Formula", mf_passes, mf_detail))
 
     return pd.DataFrame(rows, columns=columns)
 

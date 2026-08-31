@@ -13,6 +13,7 @@ from data_loader import (
     industry_metric_thresholds,
     load_raw,
     load_universe_cache,
+    magic_formula_ranking,
     merge_market_data,
     metric_moat_passes,
     moat_score,
@@ -524,11 +525,55 @@ def render_vantage_tab(universe: pd.DataFrame) -> None:
     drill_through(event, passing)
 
 
+def render_magic_formula_tab(universe: pd.DataFrame) -> None:
+    """Magic Formula (Joel Greenblatt) tab: rank companies by Earnings Yield
+    and by Return on Capital, sum the ranks, rank that sum, show the top 10.
+    Two rankings sharing one Market Cap floor — "plain WC" ROC vs. "ex cash"
+    ROC — same "two lists, one shared pre-filter" shape as Net-Net.
+    """
+    st.subheader("Magic Formula")
+    st.caption(
+        "Joel Greenblatt's Magic Formula: rank companies by Earnings Yield (PBIT / Enterprise Value) and by "
+        "Return on Capital (PBIT / (Net Block + Working Capital)), add the two ranks into a Total Rank, then "
+        "rank that sum — lower is better. Two lists sharing the same Market Cap floor, differing only in "
+        "whether Working Capital excludes cash."
+    )
+
+    min_market_cap = st.number_input("Min Market Cap (₹ Cr)", value=0.0, step=10.0, key="magic_formula_min_market_cap")
+
+    # Shadow-copy into a plain key, same fix as every other screen's controls,
+    # so the Data Explorer page's Filters section reads the current setting reliably.
+    st.session_state["magic_formula_min_market_cap_saved"] = min_market_cap
+
+    lists = [
+        ("Plain WC", "MagicROC Latest (%)"),
+        ("Ex Cash", "MagicROCExCash Latest (%)"),
+    ]
+    for label, roc_column in lists:
+        st.markdown(f"#### {label}")
+        ranked = magic_formula_ranking(universe, roc_column, min_market_cap)
+        top10 = ranked.head(10)
+
+        st.caption(f"Top 10 of **{len(ranked)}** eligible companies")
+
+        display_cols = ["Symbol", "Industry", "Earnings Yield (%)", "ROC (%)", "EY Rank", "ROC Rank", "Total Rank", "Magic Rank"]
+        event = st.dataframe(
+            top10[display_cols],
+            use_container_width=True,
+            hide_index=True,
+            on_select="rerun",
+            selection_mode="single-row",
+            key=f"magic_formula_{label}_table",
+        )
+        drill_through(event, top10)
+        st.divider()
+
+
 moats_configs = {k: v for k, v in MOAT_METRIC_CONFIG.items() if v["group"] == "moats"}
 nalanda_configs = {k: v for k, v in MOAT_METRIC_CONFIG.items() if v["group"] == "nalanda"}
 
-tab_ssgr, tab_moats, tab_nalanda, tab_ccp, tab_vijay_malik, tab_net_net, tab_vantage = st.tabs(
-    ["SSGR", "Moats", "Nalanda's F", "CCP", "Vijay Malik", "Net-Net", "Vantage"]
+tab_ssgr, tab_moats, tab_nalanda, tab_ccp, tab_vijay_malik, tab_net_net, tab_vantage, tab_magic_formula = st.tabs(
+    ["SSGR", "Moats", "Nalanda's F", "CCP", "Vijay Malik", "Net-Net", "Vantage", "Magic Formula"]
 )
 
 with tab_ssgr:
@@ -574,3 +619,6 @@ with tab_net_net:
 
 with tab_vantage:
     render_vantage_tab(universe)
+
+with tab_magic_formula:
+    render_magic_formula_tab(universe)
