@@ -11,7 +11,6 @@ from data_loader import (
     get_company_view,
     load_raw,
     load_universe_cache,
-    macro_table,
     merge_market_data,
 )
 
@@ -169,6 +168,3 @@ if symbol:
 
     st.markdown("**Quarterly Revenue CAGR**")
     st.dataframe(view["quarterly_cagr"], use_container_width=True)
-
-st.header("Macro indicators")
-st.dataframe(macro_table(sheets), use_container_width=True)

@@ -18,6 +18,8 @@ A Streamlit app for exploring the fundamentals of a universe of stocks (quarterl
   - Moats thresholds default to your own industry peers' percentile, with a manual override slider; every other screen uses fixed/manual thresholds only (no industry-relative option). Click any row in a results table to jump straight to that company in the Data Explorer.
   - **Data Explorer** also shows a **Filters** section: every screen's pass/fail verdict for the one company you're viewing, with the specific reason for any failure.
   - An optional **Market** sheet (see below) supplies live Price/P·E/Market Cap, used by the Vijay Malik and Net-Net screens and shown on the Data Explorer page.
+- **Portfolio** — your own holdings (from an optional **Portfolio** sheet, see below): Current Value, Gain/Loss, Gain (%) and portfolio-weight per holding, computed automatically, plus total Invested/Current Value/Gain summary metrics, a Current-Value-weighted overall Portfolio PE (sourced from the optional **Market** sheet), and an allocation chart. Click a row to jump to that company in the Data Explorer.
+- **Macro** — trend charts (Growth & Activity, Prices, PMI, External) built from the **Macro** sheet, a latest-snapshot table (latest/prior reading and change for every parameter), a CPI basket breakdown ranked by cumulative change since the earliest available reading, and a Manufacturing/Services PMI Expansion/Contraction status.
 
 ## Getting started
 
@@ -112,6 +114,19 @@ One row per company — typically pasted straight from a data vendor export, as 
 - There's no date column — the app always uses whatever was last saved, so staleness is on you to manage, unlike the annual/quarterly sheets.
 - If this sheet is missing entirely, or a symbol isn't in it, Price/Market Cap/P·E just show as unavailable — nothing else in the app depends on it.
 
+### `Portfolio` sheet (optional)
+
+One row per holding — your own portfolio, not the universe of all companies:
+
+| Symbol | Quantity | Invested | CMP |
+|---|---|---|---|
+| AAVAS | 40 | 50000.0 | 1450.5 |
+
+- `Symbol` must match `Industry`'s `Symbol` exactly.
+- `Current Value` (`Quantity × CMP`), `Gain/Loss`, `Gain (%)` and each holding's `Weight (%)` of the portfolio are all computed by the app — don't add those columns yourself.
+- If the optional `Market` sheet is present, each holding's `PE` is merged in from it by `Symbol`, and the page shows a Current-Value-weighted overall Portfolio PE (holdings with no usable PE are excluded, not treated as zero).
+- If this sheet is missing entirely, the **Portfolio** page just shows a prompt instead of a table.
+
 ### `Macro` sheet
 
 One row per macro parameter, with one column per date:
@@ -128,6 +143,8 @@ data_loader.py             # all data loading, reshaping, and derived-metric/scr
 pages/
   data_explorer.py          # per-company exploration page
   screens.py                 # universe-wide screens page (SSGR, Moats, Nalanda's F, CCP, Vijay Malik, Vijay Malik Pro, Net-Net, Vantage, Magic Formula)
+  portfolio.py                # your own portfolio holdings page
+  macro.py                     # macro indicators page (trends, snapshot, CPI basket, PMI status)
 tests/
   test_data_loader.py        # unit + integration tests, using hand-built synthetic sheets
 requirements.txt

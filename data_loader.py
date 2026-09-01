@@ -689,6 +689,80 @@ def merge_market_data(universe: pd.DataFrame, sheets: dict[str, pd.DataFrame]) -
     return result
 
 
+PORTFOLIO_VIEW_COLUMNS = [
+    "Symbol", "Industry", "Quantity", "Invested", "CMP", "PE", "Current Value",
+    "Gain/Loss", "Gain (%)", "Weight (%)",
+]
+
+
+def portfolio_view(sheets: dict[str, pd.DataFrame]) -> pd.DataFrame:
+    """One row per holding from the optional `Portfolio` sheet (Symbol,
+    Quantity, Invested, CMP), joined with Industry and the optional `Market`
+    sheet's PE, and extended with computed columns:
+
+    Current Value = Quantity * CMP
+    Gain/Loss = Current Value - Invested
+    Gain (%) = Gain/Loss / Invested * 100
+    Weight (%) = Current Value as a % of the whole portfolio's Current Value
+
+    Returns an empty DataFrame (with PORTFOLIO_VIEW_COLUMNS) if there's no
+    `Portfolio` sheet, so callers can check `.empty` rather than handle a
+    missing key. Deliberately uncached, like merge_market_data — a portfolio
+    is small (dozens to low hundreds of holdings), so recomputing on every
+    page load is cheap and always reflects the workbook's current numbers.
+    """
+    portfolio_sheet = sheets.get("Portfolio")
+    if portfolio_sheet is None or portfolio_sheet.empty:
+        return pd.DataFrame(columns=PORTFOLIO_VIEW_COLUMNS)
+
+    result = portfolio_sheet[["Symbol", "Quantity", "Invested", "CMP"]].copy()
+    result["Quantity"] = pd.to_numeric(result["Quantity"], errors="coerce")
+    result["Invested"] = pd.to_numeric(result["Invested"], errors="coerce")
+    result["CMP"] = pd.to_numeric(result["CMP"], errors="coerce")
+
+    result["Current Value"] = (result["Quantity"] * result["CMP"]).round(2)
+    result["Gain/Loss"] = (result["Current Value"] - result["Invested"]).round(2)
+    result["Gain (%)"] = (_safe_divide(result["Gain/Loss"], result["Invested"]) * 100).round(2)
+
+    total_value = result["Current Value"].sum()
+    if pd.notna(total_value) and total_value != 0:
+        result["Weight (%)"] = (result["Current Value"] / total_value * 100).round(2)
+    else:
+        result["Weight (%)"] = float("nan")
+
+    result = result.merge(sheets["Industry"][["Symbol", "Industry"]], on="Symbol", how="left")
+    result["Industry"] = result["Industry"].fillna("Unknown")
+
+    market_sheet = sheets.get("Market")
+    if market_sheet is not None:
+        pe_col = market_sheet[["Symbol", "PE"]].copy()
+        pe_col["PE"] = pd.to_numeric(pe_col["PE"], errors="coerce")
+        result = result.merge(pe_col, on="Symbol", how="left")
+    else:
+        result["PE"] = float("nan")
+
+    return result[PORTFOLIO_VIEW_COLUMNS]
+
+
+def portfolio_weighted_pe(holdings: pd.DataFrame) -> float:
+    """Overall portfolio PE: a simple weighted average of each holding's PE,
+    weighted by its Current Value. Holdings with no usable PE (missing, or
+    <= 0) or no positive Current Value are excluded, and the weights of the
+    remaining holdings are renormalized over just that subset — a missing
+    Market-sheet row for one holding shouldn't null out the whole portfolio's
+    headline number, unlike the "any missing input -> NA" convention used by
+    the universe screens (e.g. metric_moat_passes).
+    """
+    usable = holdings.dropna(subset=["PE", "Current Value"])
+    usable = usable[(usable["PE"] > 0) & (usable["Current Value"] > 0)]
+
+    total_value = usable["Current Value"].sum()
+    if usable.empty or total_value == 0:
+        return float("nan")
+
+    return float((usable["Current Value"] * usable["PE"]).sum() / total_value)
+
+
 def industry_metric_thresholds(
     universe: pd.DataFrame,
     row: str,
@@ -1345,7 +1419,146 @@ def save_universe_cache(df: pd.DataFrame, path: str = UNIVERSE_CACHE_FILE) -> No
     df.to_csv(path, index=False)
 
 
+CPI_BASKET_CATEGORIES = [
+    "Food and beverages",
+    "Pan, tobacco and intoxicants",
+    "Clothing and footwear",
+    "Housing, water, electricity, gas, and other fuels",
+    "Furnishings, household equipment and routine household maintenance",
+    "Health",
+    "Transport",
+    "Information and communication",
+    "Recreation, sport and culture",
+    "Education services",
+    "Restaurants and accomodation services",
+    "Personal care, social protection and miscellaneous goods and services",
+]
+
+
 def macro_table(sheets: dict[str, pd.DataFrame]) -> pd.DataFrame:
     """Macro sheet transposed so parameters are columns and dates are rows."""
     df = sheets["Macro"].set_index("Parameter")
     return df.T
+
+
+def _numeric_column(table: pd.DataFrame, name: str) -> pd.Series:
+    """Numeric version of one column of a macro_table-shaped frame (date-indexed
+    rows, most-recent-first), or all-NaN (indexed like `table`) if the
+    parameter is absent — the column-oriented counterpart to _numeric_row.
+    """
+    if name not in table.columns:
+        return pd.Series(float("nan"), index=table.index, dtype="float64")
+    return pd.to_numeric(table[name], errors="coerce")
+
+
+def macro_trend_frame(table: pd.DataFrame, columns: list[str]) -> pd.DataFrame:
+    """Select columns from a macro_table-shaped frame and reverse to
+    chronological (oldest-first) order for a line chart — the column-oriented
+    analogue of build_trend_frame (which reverses IS/BS's *columns*/periods;
+    here it's macro_table's *rows*/dates that get reversed, since the shape is
+    transposed relative to IS/BS). A column absent from `table` comes back
+    all-NaN rather than raising, same convention as build_trend_frame.
+    """
+    chronological = list(reversed(table.index))
+    data = {col: _numeric_column(table, col).reindex(chronological) for col in columns}
+    return pd.DataFrame(data, index=chronological)
+
+
+MACRO_SNAPSHOT_COLUMNS = [
+    "Parameter", "Latest Date", "Latest Value", "Prior Date", "Prior Value", "Change", "Change (%)",
+]
+
+
+def macro_latest_snapshot(table: pd.DataFrame) -> pd.DataFrame:
+    """One row per parameter (table's columns) summarizing its two most recent
+    non-null readings, found independently per parameter since different
+    parameters can have different numbers of non-null readings (e.g. GDP is
+    quarterly, so its most-recent column is often NaN while monthly
+    parameters are current — "Latest" means the newest non-null reading, not
+    just table's first row).
+
+    Latest Value / Latest Date = the newest non-null reading and its date
+    Prior Value / Prior Date = the next-newest non-null reading before that
+    Change = Latest Value - Prior Value
+    Change (%) = Change / Prior Value * 100
+
+    A parameter needs >=1 non-null reading for Latest, >=2 for
+    Prior/Change/Change (%); short of that, those fields are NaN.
+    """
+    rows = []
+    for param in table.columns:
+        non_null = _numeric_column(table, param).dropna()  # table's row order: most-recent-first
+
+        latest_date = non_null.index[0] if len(non_null) >= 1 else float("nan")
+        latest_value = non_null.iloc[0] if len(non_null) >= 1 else float("nan")
+        prior_date = non_null.index[1] if len(non_null) >= 2 else float("nan")
+        prior_value = non_null.iloc[1] if len(non_null) >= 2 else float("nan")
+
+        if len(non_null) >= 2:
+            change = round(latest_value - prior_value, 2)
+            change_pct = round(change / prior_value * 100, 2) if prior_value != 0 else float("nan")
+        else:
+            change = float("nan")
+            change_pct = float("nan")
+
+        rows.append({
+            "Parameter": param, "Latest Date": latest_date, "Latest Value": latest_value,
+            "Prior Date": prior_date, "Prior Value": prior_value, "Change": change, "Change (%)": change_pct,
+        })
+
+    return pd.DataFrame(rows, columns=MACRO_SNAPSHOT_COLUMNS)
+
+
+CPI_BASKET_RANKING_COLUMNS = [
+    "Category", "Earliest Date", "Earliest Value", "Latest Date", "Latest Value", "Change (%)",
+]
+
+
+def cpi_basket_ranking(table: pd.DataFrame) -> pd.DataFrame:
+    """CPI_BASKET_CATEGORIES ranked by cumulative % change from each
+    category's earliest available reading to its latest (independently per
+    category, like macro_latest_snapshot) — descending, biggest mover first.
+    With only a handful of months of history, earliest-to-latest is more
+    meaningful than a single month-over-month change.
+
+    Change (%) = (Latest Value - Earliest Value) / Earliest Value * 100
+    NaN (sorted last) for a category with fewer than 2 non-null readings, or
+    absent from `table` entirely.
+    """
+    rows = []
+    for category in CPI_BASKET_CATEGORIES:
+        non_null = _numeric_column(table, category).dropna()  # most-recent-first order
+
+        if len(non_null) >= 2:
+            latest_date, latest_value = non_null.index[0], non_null.iloc[0]
+            earliest_date, earliest_value = non_null.index[-1], non_null.iloc[-1]
+            change_pct = (
+                round((latest_value - earliest_value) / earliest_value * 100, 2)
+                if earliest_value != 0 else float("nan")
+            )
+        else:
+            latest_date = non_null.index[0] if len(non_null) == 1 else float("nan")
+            latest_value = non_null.iloc[0] if len(non_null) == 1 else float("nan")
+            earliest_date, earliest_value, change_pct = float("nan"), float("nan"), float("nan")
+
+        rows.append({
+            "Category": category, "Earliest Date": earliest_date, "Earliest Value": earliest_value,
+            "Latest Date": latest_date, "Latest Value": latest_value, "Change (%)": change_pct,
+        })
+
+    result = pd.DataFrame(rows, columns=CPI_BASKET_RANKING_COLUMNS)
+    return result.sort_values("Change (%)", ascending=False, na_position="last").reset_index(drop=True)
+
+
+def pmi_status(value: float) -> str:
+    """Translate a PMI diffusion-index reading into its industry-standard
+    status: "Expansion" (>50), "Contraction" (<50), "No Change" (==50), or
+    "—" if `value` is NaN.
+    """
+    if pd.isna(value):
+        return "—"
+    if value > 50:
+        return "Expansion"
+    if value < 50:
+        return "Contraction"
+    return "No Change"

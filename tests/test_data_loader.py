@@ -3,6 +3,7 @@ import pytest
 
 from data_loader import (
     CCP_EXTRA_CACHE_ROWS,
+    CPI_BASKET_CATEGORIES,
     MOAT_METRIC_CONFIG,
     _cagr_pct,
     _safe_divide,
@@ -19,16 +20,22 @@ from data_loader import (
     build_universe_cache,
     company_metric_table,
     company_vantage_metrics,
+    cpi_basket_ranking,
     evaluate_screens_for_company,
     failure_detail,
     get_company_view,
     industry_metric_thresholds,
     load_universe_cache,
+    macro_latest_snapshot,
+    macro_trend_frame,
     magic_formula_ranking,
     merge_market_data,
     metric_moat_passes,
     moat_score,
     net_net_passes,
+    pmi_status,
+    portfolio_view,
+    portfolio_weighted_pe,
     save_universe_cache,
     scalar_metric_passes,
     vantage_metrics,
@@ -511,6 +518,159 @@ def test_merge_market_data_zero_market_cap_is_treated_as_missing():
 
     assert pd.isna(result["Market Cap (Cr)"].iloc[0])
     assert result["Price"].iloc[0] == 641.05  # Price/PE are untouched by this guard
+
+
+# --- portfolio_view ---------------------------------------------------------------
+
+def _portfolio_sheets(portfolio_rows: list[dict], industry_rows: list[dict] | None = None) -> dict:
+    industry_rows = industry_rows if industry_rows is not None else [
+        {"Symbol": "AAA", "Industry": "Chemicals"}, {"Symbol": "BBB", "Industry": "Pharmaceuticals"},
+    ]
+    return {
+        "Portfolio": pd.DataFrame(portfolio_rows),
+        "Industry": pd.DataFrame(industry_rows),
+    }
+
+
+def test_portfolio_view_matches_hand_computed_values():
+    sheets = _portfolio_sheets([
+        {"Symbol": "AAA", "Quantity": 10, "Invested": 1000.0, "CMP": 120.0},  # Value 1200, Gain 200 (20%)
+        {"Symbol": "BBB", "Quantity": 5, "Invested": 1000.0, "CMP": 160.0},  # Value 800, Gain -200 (-20%)
+    ])
+
+    result = portfolio_view(sheets)
+
+    aaa = result.loc[result["Symbol"] == "AAA"].iloc[0]
+    assert aaa["Current Value"] == 1200.0
+    assert aaa["Gain/Loss"] == 200.0
+    assert aaa["Gain (%)"] == 20.0
+    assert aaa["Industry"] == "Chemicals"
+    assert aaa["Weight (%)"] == 60.0  # 1200 / (1200+800) * 100
+
+    bbb = result.loc[result["Symbol"] == "BBB"].iloc[0]
+    assert bbb["Current Value"] == 800.0
+    assert bbb["Gain/Loss"] == -200.0
+    assert bbb["Gain (%)"] == -20.0
+    assert bbb["Industry"] == "Pharmaceuticals"
+    assert bbb["Weight (%)"] == 40.0
+
+    assert result["Weight (%)"].sum() == pytest.approx(100.0)
+
+
+def test_portfolio_view_no_portfolio_sheet_is_empty_with_expected_columns():
+    result = portfolio_view({"Industry": pd.DataFrame({"Symbol": ["AAA"], "Industry": ["Chemicals"]})})
+
+    assert result.empty
+    assert list(result.columns) == [
+        "Symbol", "Industry", "Quantity", "Invested", "CMP", "PE", "Current Value",
+        "Gain/Loss", "Gain (%)", "Weight (%)",
+    ]
+
+
+def test_portfolio_view_unknown_symbol_gets_unknown_industry():
+    sheets = _portfolio_sheets(
+        [{"Symbol": "ZZZ", "Quantity": 10, "Invested": 1000.0, "CMP": 120.0}],
+        industry_rows=[{"Symbol": "AAA", "Industry": "Chemicals"}],
+    )
+
+    result = portfolio_view(sheets)
+
+    assert result.iloc[0]["Industry"] == "Unknown"
+
+
+def test_portfolio_view_zero_invested_gain_pct_is_nan():
+    sheets = _portfolio_sheets([{"Symbol": "AAA", "Quantity": 10, "Invested": 0.0, "CMP": 120.0}])
+
+    result = portfolio_view(sheets)
+
+    assert result.iloc[0]["Current Value"] == 1200.0
+    assert result.iloc[0]["Gain/Loss"] == 1200.0
+    assert pd.isna(result.iloc[0]["Gain (%)"])
+
+
+def test_portfolio_view_all_zero_current_value_weight_is_nan_not_crash():
+    sheets = _portfolio_sheets([
+        {"Symbol": "AAA", "Quantity": 0, "Invested": 1000.0, "CMP": 120.0},
+        {"Symbol": "BBB", "Quantity": 0, "Invested": 500.0, "CMP": 160.0},
+    ])
+
+    result = portfolio_view(sheets)
+
+    assert result["Weight (%)"].isna().all()
+
+
+def test_portfolio_view_merges_pe_from_market_sheet():
+    sheets = _portfolio_sheets([
+        {"Symbol": "AAA", "Quantity": 10, "Invested": 1000.0, "CMP": 120.0},
+        {"Symbol": "BBB", "Quantity": 5, "Invested": 1000.0, "CMP": 160.0},
+    ])
+    sheets["Market"] = pd.DataFrame({"Symbol": ["AAA", "BBB"], "PE": [20.0, 35.5]})
+
+    result = portfolio_view(sheets)
+
+    assert result.loc[result["Symbol"] == "AAA"].iloc[0]["PE"] == 20.0
+    assert result.loc[result["Symbol"] == "BBB"].iloc[0]["PE"] == 35.5
+
+
+def test_portfolio_view_pe_nan_when_symbol_missing_from_market_sheet():
+    sheets = _portfolio_sheets([{"Symbol": "AAA", "Quantity": 10, "Invested": 1000.0, "CMP": 120.0}])
+    sheets["Market"] = pd.DataFrame({"Symbol": ["ZZZ"], "PE": [20.0]})
+
+    result = portfolio_view(sheets)
+
+    assert pd.isna(result.iloc[0]["PE"])
+
+
+def test_portfolio_view_pe_nan_when_no_market_sheet():
+    sheets = _portfolio_sheets([{"Symbol": "AAA", "Quantity": 10, "Invested": 1000.0, "CMP": 120.0}])
+
+    result = portfolio_view(sheets)
+
+    assert pd.isna(result.iloc[0]["PE"])
+
+
+# --- portfolio_weighted_pe ---------------------------------------------------------
+
+def test_portfolio_weighted_pe_matches_hand_computed_value():
+    holdings = pd.DataFrame({
+        "Current Value": [1200.0, 800.0],  # weights 60% / 40%
+        "PE": [20.0, 40.0],
+    })
+
+    result = portfolio_weighted_pe(holdings)
+
+    assert result == pytest.approx(0.6 * 20.0 + 0.4 * 40.0)  # 28.0
+
+
+def test_portfolio_weighted_pe_excludes_missing_pe_and_renormalizes():
+    holdings = pd.DataFrame({
+        "Current Value": [1200.0, 800.0],
+        "PE": [20.0, float("nan")],
+    })
+
+    result = portfolio_weighted_pe(holdings)
+
+    assert result == pytest.approx(20.0)  # BBB excluded entirely, not treated as 0
+
+
+def test_portfolio_weighted_pe_excludes_non_positive_pe():
+    holdings = pd.DataFrame({
+        "Current Value": [1200.0, 800.0],
+        "PE": [20.0, -5.0],
+    })
+
+    result = portfolio_weighted_pe(holdings)
+
+    assert result == pytest.approx(20.0)
+
+
+def test_portfolio_weighted_pe_nan_when_no_usable_pe():
+    holdings = pd.DataFrame({
+        "Current Value": [1200.0, 800.0],
+        "PE": [float("nan"), float("nan")],
+    })
+
+    assert pd.isna(portfolio_weighted_pe(holdings))
 
 
 # --- build_universe_cache / cache ------------------------------------------------
@@ -1392,3 +1552,149 @@ def test_evaluate_screens_for_company_symbol_not_in_universe():
     assert len(result) == 29
     assert result["Passes"].isna().all()
     assert (result["Detail"] == "not in Screens cache — click Refresh on the Screens page").all()
+
+
+# --- macro_trend_frame ---------------------------------------------------------
+
+def test_macro_trend_frame_orders_chronologically():
+    table = pd.DataFrame({"IIP": [130.0, 125.0, 120.0]}, index=["26-03", "26-02", "26-01"])
+
+    result = macro_trend_frame(table, ["IIP"])
+
+    assert list(result.index) == ["26-01", "26-02", "26-03"]
+    assert result.loc["26-01", "IIP"] == 120.0
+    assert result.loc["26-02", "IIP"] == 125.0
+    assert result.loc["26-03", "IIP"] == 130.0
+
+
+def test_macro_trend_frame_missing_column_is_all_nan():
+    table = pd.DataFrame({"IIP": [130.0, 125.0]}, index=["26-02", "26-01"])
+
+    result = macro_trend_frame(table, ["IIP", "GDP"])
+
+    assert list(result.columns) == ["IIP", "GDP"]
+    assert result["GDP"].isna().all()
+
+
+# --- macro_latest_snapshot -------------------------------------------------------
+
+def test_macro_latest_snapshot_matches_hand_computed_values():
+    table = pd.DataFrame({"FX reserves - USD Bn": [640.0, 620.0, 600.0]}, index=["26-03", "26-02", "26-01"])
+
+    result = macro_latest_snapshot(table)
+    row = result[result["Parameter"] == "FX reserves - USD Bn"].iloc[0]
+
+    assert row["Latest Date"] == "26-03"
+    assert row["Latest Value"] == 640.0
+    assert row["Prior Date"] == "26-02"
+    assert row["Prior Value"] == 620.0
+    assert row["Change"] == 20.0
+    assert row["Change (%)"] == pytest.approx(20 / 620 * 100, abs=0.01)
+
+
+def test_macro_latest_snapshot_falls_back_past_nan_latest_column():
+    # GDP-style: most-recent column is NaN (quarterly data lagging a monthly sheet).
+    table = pd.DataFrame({"GDP": [float("nan"), 0.078, 0.075]}, index=["26-03", "26-02", "26-01"])
+
+    result = macro_latest_snapshot(table)
+    row = result[result["Parameter"] == "GDP"].iloc[0]
+
+    assert row["Latest Date"] == "26-02"
+    assert row["Latest Value"] == 0.078
+    assert row["Prior Date"] == "26-01"
+    assert row["Prior Value"] == 0.075
+
+
+def test_macro_latest_snapshot_fewer_than_two_readings_is_nan():
+    table = pd.DataFrame({"Manufacturing PMI": [55.0, float("nan"), float("nan")]}, index=["26-03", "26-02", "26-01"])
+
+    result = macro_latest_snapshot(table)
+    row = result[result["Parameter"] == "Manufacturing PMI"].iloc[0]
+
+    assert row["Latest Value"] == 55.0
+    assert pd.isna(row["Prior Value"])
+    assert pd.isna(row["Change"])
+    assert pd.isna(row["Change (%)"])
+
+
+def test_macro_latest_snapshot_all_nan_parameter():
+    table = pd.DataFrame({"Services PMI": [float("nan"), float("nan")]}, index=["26-02", "26-01"])
+
+    result = macro_latest_snapshot(table)
+    row = result[result["Parameter"] == "Services PMI"].iloc[0]
+
+    assert pd.isna(row["Latest Value"])
+    assert pd.isna(row["Latest Date"])
+    assert pd.isna(row["Prior Value"])
+
+
+def test_macro_latest_snapshot_zero_prior_value_change_pct_is_nan():
+    table = pd.DataFrame({"CPI": [10.0, 0.0]}, index=["26-02", "26-01"])
+
+    result = macro_latest_snapshot(table)
+    row = result[result["Parameter"] == "CPI"].iloc[0]
+
+    assert row["Change"] == 10.0
+    assert pd.isna(row["Change (%)"])
+
+
+# --- cpi_basket_ranking ----------------------------------------------------------
+
+def test_cpi_basket_ranking_orders_by_cumulative_pct_change_descending():
+    table = pd.DataFrame({
+        "Food and beverages": [112.0, 108.0, 100.0],  # +12% earliest(100)->latest(112)
+        "Health": [103.0, 101.0, 100.0],               # +3%
+        "Transport": [95.0, 98.0, 100.0],              # -5%
+    }, index=["26-03", "26-02", "26-01"])
+
+    result = cpi_basket_ranking(table)
+    ranked = result[result["Change (%)"].notna()]
+
+    assert list(ranked["Category"]) == ["Food and beverages", "Health", "Transport"]
+    assert ranked.iloc[0]["Change (%)"] == pytest.approx(12.0)
+    assert ranked.iloc[1]["Change (%)"] == pytest.approx(3.0)
+    assert ranked.iloc[2]["Change (%)"] == pytest.approx(-5.0)
+    assert ranked.iloc[0]["Earliest Date"] == "26-01"
+    assert ranked.iloc[0]["Latest Date"] == "26-03"
+
+
+def test_cpi_basket_ranking_missing_category_is_nan_and_sorted_last():
+    table = pd.DataFrame({"Food and beverages": [112.0, 100.0]}, index=["26-02", "26-01"])
+    # every other CPI_BASKET_CATEGORIES entry is absent from `table`
+
+    result = cpi_basket_ranking(table)
+
+    assert result.iloc[0]["Category"] == "Food and beverages"
+    assert result.iloc[0]["Change (%)"] == pytest.approx(12.0)
+    assert result["Change (%)"].iloc[1:].isna().all()
+    assert set(result["Category"]) == set(CPI_BASKET_CATEGORIES)
+    assert len(result) == len(CPI_BASKET_CATEGORIES)
+
+
+def test_cpi_basket_ranking_single_reading_is_nan():
+    table = pd.DataFrame({"Health": [100.0]}, index=["26-01"])
+
+    result = cpi_basket_ranking(table)
+    row = result[result["Category"] == "Health"].iloc[0]
+
+    assert pd.isna(row["Change (%)"])
+    assert row["Latest Value"] == 100.0
+    assert pd.isna(row["Earliest Value"])
+
+
+# --- pmi_status --------------------------------------------------------------------
+
+def test_pmi_status_expansion():
+    assert pmi_status(54.3) == "Expansion"
+
+
+def test_pmi_status_contraction():
+    assert pmi_status(47.8) == "Contraction"
+
+
+def test_pmi_status_no_change():
+    assert pmi_status(50.0) == "No Change"
+
+
+def test_pmi_status_nan():
+    assert pmi_status(float("nan")) == "—"
