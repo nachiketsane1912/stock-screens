@@ -2,6 +2,8 @@ import pandas as pd
 import pytest
 
 from data_loader import (
+    BOTTOM_UP_BS_ROWS,
+    BOTTOM_UP_IS_ROWS,
     CCP_EXTRA_CACHE_ROWS,
     CPI_BASKET_CATEGORIES,
     MOAT_METRIC_CONFIG,
@@ -14,7 +16,11 @@ from data_loader import (
     add_roce,
     add_ssgr,
     add_ttm_column,
+    aggregate_universe_by_year,
     and_tri_state,
+    annual_period_labels,
+    bottom_up_aggregate_table,
+    bottom_up_borr_vs_nb,
     build_cagr_table,
     build_trend_frame,
     build_universe_cache,
@@ -25,9 +31,11 @@ from data_loader import (
     failure_detail,
     get_company_view,
     industry_metric_thresholds,
+    industry_scalar_thresholds,
     load_universe_cache,
     macro_latest_snapshot,
     macro_trend_frame,
+    macro_yoy_frame,
     magic_formula_ranking,
     merge_market_data,
     metric_moat_passes,
@@ -35,6 +43,7 @@ from data_loader import (
     net_net_passes,
     pmi_status,
     portfolio_view,
+    portfolio_fundamentals,
     portfolio_weighted_pe,
     save_universe_cache,
     scalar_metric_passes,
@@ -673,6 +682,57 @@ def test_portfolio_weighted_pe_nan_when_no_usable_pe():
     assert pd.isna(portfolio_weighted_pe(holdings))
 
 
+# --- portfolio_fundamentals --------------------------------------------------------
+
+def _fundamentals_row(result, metric):
+    return result[result["Metric"] == metric].iloc[0]
+
+
+def test_portfolio_fundamentals_median_and_weighted_average():
+    holdings = pd.DataFrame({
+        "Symbol": ["AAA", "BBB", "CCC"],
+        "Current Value": [500.0, 300.0, 200.0],  # weights 50% / 30% / 20%
+    })
+    universe = pd.DataFrame({
+        "Symbol": ["AAA", "BBB", "CCC"],
+        "ROCEExCash Y1 (%)": [10.0, 20.0, 40.0],
+    })
+
+    row = _fundamentals_row(portfolio_fundamentals(holdings, universe), "Nalanda's F (ROCE ex-cash)")
+
+    assert row["Median"] == pytest.approx(20.0)
+    assert row["Weighted Avg"] == pytest.approx(0.5 * 10 + 0.3 * 20 + 0.2 * 40)  # 19.0
+    assert row["Coverage"] == "3 of 3 holdings"
+
+
+def test_portfolio_fundamentals_excludes_missing_and_renormalizes():
+    holdings = pd.DataFrame({
+        "Symbol": ["AAA", "BBB", "CCC"],
+        "Current Value": [600.0, 400.0, 1000.0],
+    })
+    universe = pd.DataFrame({
+        "Symbol": ["AAA", "BBB"],  # CCC absent from the universe entirely
+        "ROE Y1 (%)": [10.0, float("nan")],
+    })
+
+    row = _fundamentals_row(portfolio_fundamentals(holdings, universe), "ROE")
+
+    assert row["Median"] == pytest.approx(10.0)
+    assert row["Weighted Avg"] == pytest.approx(10.0)
+    assert row["Coverage"] == "1 of 3 holdings"
+
+
+def test_portfolio_fundamentals_nan_when_no_usable_values():
+    holdings = pd.DataFrame({"Symbol": ["AAA"], "Current Value": [100.0]})
+    universe = pd.DataFrame({"Symbol": ["AAA"], "ROCE Y1 (%)": [float("nan")]})
+
+    row = _fundamentals_row(portfolio_fundamentals(holdings, universe), "ROCE")
+
+    assert pd.isna(row["Median"])
+    assert pd.isna(row["Weighted Avg"])
+    assert row["Coverage"] == "0 of 1 holdings"
+
+
 # --- build_universe_cache / cache ------------------------------------------------
 
 def test_build_universe_cache_returns_one_row_per_symbol_and_reports_progress():
@@ -684,7 +744,7 @@ def test_build_universe_cache_returns_one_row_per_symbol_and_reports_progress():
         "Rev": rev_full, "Exp": [0.6 * r for r in rev_full], "OI": [0.0] * 11, "Int": [0.1 * r for r in rev_full],
         "Dep": [0.05 * r for r in rev_full], "Net": [0.1 * r for r in rev_full], "Div": [0.0] * 11,
     }, years_full)
-    bs_aaa = make_wide_sheet("AAA", {"NB": [500.0] * 11, "Borr": [100.0] * 11}, years_full)
+    bs_aaa = make_wide_sheet("AAA", {"NB": [500.0] * 11, "WIP": [50.0] * 11, "Borr": [100.0] * 11}, years_full)
     quarters = ["Q127", "Q426", "Q326", "Q226", "Q126", "Q425", "Q325", "Q225", "Q125", "Q424", "Q324"]
     rev_q = [1024 / 2**k for k in range(11)]
     quarter_aaa = make_wide_sheet("AAA", {
@@ -698,7 +758,7 @@ def test_build_universe_cache_returns_one_row_per_symbol_and_reports_progress():
         "Rev": [200.0, 180.0], "Exp": [120.0, 108.0], "OI": [0.0, 0.0], "Int": [0.1 * 200, 0.1 * 180],
         "Dep": [10.0, 9.0], "Net": [20.0, 18.0], "Div": [0.0, 0.0],
     }, years_short)
-    bs_bbb = make_wide_sheet("BBB", {"NB": [100.0, 100.0], "Borr": [50.0, 50.0]}, years_short)
+    bs_bbb = make_wide_sheet("BBB", {"NB": [100.0, 100.0], "WIP": [20.0, 20.0], "Borr": [50.0, 50.0]}, years_short)
     quarter_bbb = make_wide_sheet("BBB", {
         "Rev": [50.0, 48.0, 46.0, 44.0], "Exp": [30.0, 29.0, 28.0, 27.0],
         "OI": [0.0] * 4, "Int": [0.0] * 4, "Dep": [2.0] * 4, "Net": [5.0, 4.8, 4.6, 4.4],
@@ -726,6 +786,9 @@ def test_build_universe_cache_returns_one_row_per_symbol_and_reports_progress():
     expected_cols |= {f"Int Y{y} (Cr)" for y in range(1, 11)} | {f"CFO Y{y} (Cr)" for y in range(1, 11)}
     rows_needed = {config["row"] for config in MOAT_METRIC_CONFIG.values()} | CCP_EXTRA_CACHE_ROWS
     expected_cols |= {f"{row} Y{y} (%)" for row in rows_needed for y in range(1, 11)}
+    expected_cols |= {
+        f"{row} Y{y} (Cr)" for row in [*BOTTOM_UP_IS_ROWS, *BOTTOM_UP_BS_ROWS] for y in range(1, 11)
+    }
     assert list(result["Symbol"]) == ["AAA", "BBB"]
     assert set(result.columns) == expected_cols
 
@@ -740,6 +803,20 @@ def test_build_universe_cache_returns_one_row_per_symbol_and_reports_progress():
     # Rev doubles every year (backward) -> RevGrowth = 100% every year.
     for y in range(1, 11):
         assert aaa_row[f"RevGrowth Y{y} (%)"] == pytest.approx(100.0)
+    # Bottom-up raw series: Y1 = latest FY (rev_full[0] = 1024).
+    assert aaa_row["Rev Y1 (Cr)"] == pytest.approx(1024.0)
+    assert aaa_row["Exp Y1 (Cr)"] == pytest.approx(0.6 * 1024.0)
+    assert aaa_row["OP Y1 (Cr)"] == pytest.approx(0.4 * 1024.0)
+    assert aaa_row["Net Y1 (Cr)"] == pytest.approx(0.1 * 1024.0)
+    # Borr is a flat 100, NB a flat 500 every year in the AAA fixture -> all
+    # 10 cached years equal.
+    for y in range(1, 11):
+        assert aaa_row[f"Borr Y{y} (Cr)"] == pytest.approx(100.0)
+        assert aaa_row[f"NB Y{y} (Cr)"] == pytest.approx(500.0)
+    # NB+WIP is flat (500+50) every year -> year-over-year delta is 0, so
+    # Capex = Dep = 0.05*Rev for every one of the 10 cached years.
+    assert aaa_row["Capex Y1 (Cr)"] == pytest.approx(0.05 * 1024.0)
+    assert aaa_row["Capex Y2 (Cr)"] == pytest.approx(0.05 * 512.0)
 
     bbb_row = result[result["Symbol"] == "BBB"].iloc[0]
     assert pd.isna(bbb_row["Rev 10Y CAGR (%)"])
@@ -752,6 +829,24 @@ def test_build_universe_cache_returns_one_row_per_symbol_and_reports_progress():
     for y in range(3, 11):
         assert pd.isna(bbb_row[f"OPM Y{y} (%)"])
         assert pd.isna(bbb_row[f"LowDebt Y{y} (%)"])
+    # BBB only has 2 years of IS/BS history -> Y1/Y2 present, Y3-10 NaN, same
+    # pattern as OPM/LowDebt above.
+    assert bbb_row["Rev Y1 (Cr)"] == pytest.approx(200.0)
+    assert bbb_row["Borr Y1 (Cr)"] == pytest.approx(50.0)
+    assert bbb_row["Borr Y2 (Cr)"] == pytest.approx(50.0)
+    assert bbb_row["NB Y1 (Cr)"] == pytest.approx(100.0)
+    assert bbb_row["NB Y2 (Cr)"] == pytest.approx(100.0)
+    for y in range(3, 11):
+        assert pd.isna(bbb_row[f"Rev Y{y} (Cr)"])
+        assert pd.isna(bbb_row[f"Borr Y{y} (Cr)"])
+        assert pd.isna(bbb_row[f"NB Y{y} (Cr)"])
+    # NB+WIP is flat (100+20) for both of BBB's 2 years -> Capex Y1 = Dep Y1
+    # (10.0), but Capex Y2 is NaN not from insufficient history (BBB has
+    # exactly 2 years, same as OPM/LowDebt above) but because Y2 *is* the
+    # oldest year in the fixture and Capex always needs an earlier year to
+    # diff against.
+    assert bbb_row["Capex Y1 (Cr)"] == pytest.approx(10.0)
+    assert pd.isna(bbb_row["Capex Y2 (Cr)"])
 
     assert progress_calls[-1] == (2, 2)
 
@@ -895,6 +990,39 @@ def test_industry_metric_thresholds_median_consistency_uses_10_year_median_not_y
     assert result.iloc[0] == pytest.approx(expected)
 
 
+# --- industry_scalar_thresholds ---------------------------------------------------
+
+def test_industry_scalar_thresholds_percentile_and_small_industry_fallback():
+    universe = pd.DataFrame({
+        "Symbol": ["A1", "A2", "A3", "A4", "A5", "B1", "B2"],
+        "Industry": ["Big"] * 5 + ["Small"] * 2,
+        "Rev 10Y CAGR (%)": [10.0, 20.0, 30.0, 40.0, 50.0, 60.0, 70.0],
+    })
+
+    result = industry_scalar_thresholds(universe, "Rev 10Y CAGR (%)", percentile=0.75, min_companies=5, fallback=15.0)
+
+    big_threshold = result[universe["Industry"] == "Big"]
+    expected_big = universe[universe["Industry"] == "Big"]["Rev 10Y CAGR (%)"].quantile(0.75)
+    assert big_threshold.nunique() == 1
+    assert big_threshold.iloc[0] == pytest.approx(expected_big)
+
+    small_threshold = result[universe["Industry"] == "Small"]
+    assert (small_threshold == 15.0).all()  # only 2 companies -> falls back
+
+
+def test_industry_scalar_thresholds_nan_value_does_not_count_toward_min_companies():
+    universe = pd.DataFrame({
+        "Symbol": ["A1", "A2", "A3", "A4", "A5"],
+        "Industry": ["Big"] * 5,
+        "Rev 10Y CAGR (%)": [10.0, 20.0, 30.0, 40.0, float("nan")],
+    })
+
+    result = industry_scalar_thresholds(universe, "Rev 10Y CAGR (%)", percentile=0.75, min_companies=5, fallback=15.0)
+
+    # Only 4 non-NaN values -> below min_companies=5 -> falls back, even though 5 rows exist.
+    assert (result == 15.0).all()
+
+
 # --- scalar_metric_passes ---------------------------------------------------------
 
 def test_scalar_metric_passes_higher_direction():
@@ -914,6 +1042,17 @@ def test_scalar_metric_passes_lower_direction():
 
     assert result.iloc[0] is True
     assert result.iloc[1] is False
+
+
+def test_scalar_metric_passes_per_company_series_threshold():
+    # Each company compared against its own threshold, not one shared value.
+    values = pd.Series([20.0, 20.0], index=["A", "B"])
+    thresholds = pd.Series([15.0, 25.0], index=["A", "B"])
+
+    result = scalar_metric_passes(values, threshold=thresholds, direction="higher")
+
+    assert result.loc["A"] is True   # 20 > 15
+    assert result.loc["B"] is False  # 20 > 25 is False
 
 
 # --- vijay_malik_passes -------------------------------------------------------------
@@ -1074,6 +1213,80 @@ def test_weighted_average_by_year_missing_year_is_nan():
     universe = pd.DataFrame({"CFO Y1 (Cr)": [30.0], "CFO Y2 (Cr)": [float("nan")], "CFO Y3 (Cr)": [10.0]})
     result = weighted_average_by_year(universe, "CFO", "Cr", decay=0.5, years=3)
     assert pd.isna(result.iloc[0])
+
+
+# --- aggregate_universe_by_year / bottom_up_aggregate_table / bottom_up_borr_vs_nb --
+
+def test_aggregate_universe_by_year_sums_skipna_per_year():
+    # Company 3 has no Y1 value, company 2 has no Y2 value -> each year's sum
+    # only includes whoever reports that year, not zeroed or excluded overall.
+    universe = pd.DataFrame({
+        "Rev Y1 (Cr)": [100.0, 50.0, float("nan")],
+        "Rev Y2 (Cr)": [90.0, float("nan"), 20.0],
+    })
+    result = aggregate_universe_by_year(universe, "Rev", "Cr", years=2)
+    assert result["Y1"] == pytest.approx(150.0)
+    assert result["Y2"] == pytest.approx(110.0)
+
+
+def test_annual_period_labels_reads_real_fy_from_is_sheet():
+    sheets = {"IS": pd.DataFrame({
+        "Symbol": ["AAA"], "Rev-26": [100.0], "Rev-25": [90.0], "Rev-24": [80.0],
+    })}
+    assert annual_period_labels(sheets, years=3) == ["FY26", "FY25", "FY24"]
+    # Asking for more years than the sheet has just returns what exists.
+    assert annual_period_labels(sheets, years=10) == ["FY26", "FY25", "FY24"]
+
+
+def test_bottom_up_aggregate_table_derives_margins_from_aggregate_totals():
+    # Two companies with very different individual margins (40% and 10% OPM).
+    universe = pd.DataFrame({
+        "Rev Y1 (Cr)": [100.0, 50.0], "Exp Y1 (Cr)": [60.0, 45.0], "OP Y1 (Cr)": [40.0, 5.0],
+        "Int Y1 (Cr)": [0.0, 0.0], "Dep Y1 (Cr)": [0.0, 0.0],
+        "PBT Y1 (Cr)": [40.0, 5.0], "Net Y1 (Cr)": [30.0, 4.0], "Capex Y1 (Cr)": [10.0, 5.0],
+    })
+    result = bottom_up_aggregate_table(universe, period_labels=["FY24"], years=1)
+    assert list(result.index) == ["FY24"]
+    assert result.loc["FY24", "Rev"] == pytest.approx(150.0)
+    assert result.loc["FY24", "OP"] == pytest.approx(45.0)
+    # sum(OP)=45, sum(Rev)=150 -> aggregate OPM = 30%, NOT the simple average
+    # of each company's own OPM (40% and 10% -> average 25%).
+    assert result.loc["FY24", "OPM"] == pytest.approx(30.0)
+    assert result.loc["FY24", "NPM"] == pytest.approx(34.0 / 150.0 * 100.0)
+    # sum(Capex)=15, sum(Rev)=150 -> aggregate CapexIntensity = 10%.
+    assert result.loc["FY24", "Capex"] == pytest.approx(15.0)
+    assert result.loc["FY24", "CapexIntensity"] == pytest.approx(10.0)
+    assert "OI" not in result.columns
+
+
+def test_bottom_up_aggregate_table_is_chronological_with_partial_history():
+    # Company B only reports Y1 (its Y2 columns are simply absent from the
+    # cache, same as a real company with less than a full 10Y history) -> it
+    # should still contribute to Y1's sum without breaking Y2's.
+    universe = pd.DataFrame({
+        "Rev Y1 (Cr)": [100.0, 20.0], "Rev Y2 (Cr)": [80.0, float("nan")],
+        "Exp Y1 (Cr)": [60.0, 12.0], "Exp Y2 (Cr)": [50.0, float("nan")],
+        "OP Y1 (Cr)": [40.0, 8.0], "OP Y2 (Cr)": [30.0, float("nan")],
+        "Int Y1 (Cr)": [0.0, 0.0], "Int Y2 (Cr)": [0.0, float("nan")],
+        "Dep Y1 (Cr)": [0.0, 0.0], "Dep Y2 (Cr)": [0.0, float("nan")],
+        "PBT Y1 (Cr)": [40.0, 8.0], "PBT Y2 (Cr)": [30.0, float("nan")],
+        "Net Y1 (Cr)": [30.0, 6.0], "Net Y2 (Cr)": [20.0, float("nan")],
+        "Capex Y1 (Cr)": [10.0, 4.0], "Capex Y2 (Cr)": [8.0, float("nan")],
+    })
+    result = bottom_up_aggregate_table(universe, period_labels=["FY25", "FY24"], years=2)
+    assert list(result.index) == ["FY24", "FY25"]
+    assert result.loc["FY24", "Rev"] == pytest.approx(80.0)
+    assert result.loc["FY25", "Rev"] == pytest.approx(120.0)
+    assert result.loc["FY24", "Capex"] == pytest.approx(8.0)
+    assert result.loc["FY25", "Capex"] == pytest.approx(14.0)
+
+
+def test_bottom_up_borr_vs_nb_matches_hand_computed_sums():
+    universe = pd.DataFrame({"Borr Y1 (Cr)": [100.0, 50.0], "NB Y1 (Cr)": [20.0, 5.0]})
+    result = bottom_up_borr_vs_nb(universe, period_labels=["FY24"], years=1)
+    assert list(result.index) == ["FY24"]
+    assert result.loc["FY24", "Borr"] == pytest.approx(150.0)
+    assert result.loc["FY24", "NB"] == pytest.approx(25.0)
 
 
 # --- vantage_metrics ----------------------------------------------------------------
@@ -1574,6 +1787,46 @@ def test_macro_trend_frame_missing_column_is_all_nan():
 
     assert list(result.columns) == ["IIP", "GDP"]
     assert result["GDP"].isna().all()
+
+
+# --- macro_yoy_frame -----------------------------------------------------------
+
+def test_macro_yoy_frame_computes_pct_change_after_enough_periods():
+    # periods_back=2: the 3rd (chronologically) reading is comparable to the 1st.
+    table = pd.DataFrame({"IIP": [110.0, 105.0, 100.0]}, index=["26-03", "26-02", "26-01"])
+
+    result = macro_yoy_frame(table, ["IIP"], periods_back=2)
+
+    assert list(result.index) == ["26-01", "26-02", "26-03"]
+    assert pd.isna(result.loc["26-01", "IIP"])
+    assert pd.isna(result.loc["26-02", "IIP"])
+    assert result.loc["26-03", "IIP"] == pytest.approx((110.0 - 100.0) / 100.0 * 100)
+
+
+def test_macro_yoy_frame_nan_when_not_enough_periods_yet():
+    # Only 3 months of data, periods_back=12 (a real YoY window) -> nothing comparable yet.
+    table = pd.DataFrame({"IIP": [110.0, 105.0, 100.0]}, index=["26-03", "26-02", "26-01"])
+
+    result = macro_yoy_frame(table, ["IIP"], periods_back=12)
+
+    assert result["IIP"].isna().all()
+
+
+def test_macro_yoy_frame_missing_column_is_all_nan():
+    table = pd.DataFrame({"IIP": [130.0, 125.0]}, index=["26-02", "26-01"])
+
+    result = macro_yoy_frame(table, ["IIP", "GDP"], periods_back=1)
+
+    assert list(result.columns) == ["IIP", "GDP"]
+    assert result["GDP"].isna().all()
+
+
+def test_macro_yoy_frame_zero_prior_value_is_nan_not_crash():
+    table = pd.DataFrame({"CPI": [10.0, 0.0]}, index=["26-02", "26-01"])
+
+    result = macro_yoy_frame(table, ["CPI"], periods_back=1)
+
+    assert pd.isna(result.loc["26-02", "CPI"])
 
 
 # --- macro_latest_snapshot -------------------------------------------------------

@@ -1,7 +1,7 @@
 import pandas as pd
 import streamlit as st
 
-from data_loader import load_raw, portfolio_view, portfolio_weighted_pe
+from data_loader import load_raw, load_universe_cache, portfolio_fundamentals, portfolio_view, portfolio_weighted_pe
 
 st.title("Portfolio")
 
@@ -33,6 +33,25 @@ col2.metric("Current Value", f"₹{total_value:,.2f}")
 col3.metric("Gain/Loss", f"₹{total_gain:,.2f}")
 col4.metric("Gain (%)", f"{total_gain_pct:.2f}%" if pd.notna(total_gain_pct) else "—")
 col5.metric("Portfolio PE", f"{portfolio_pe:.2f}" if pd.notna(portfolio_pe) else "—")
+
+st.markdown("**Fundamentals**")
+universe = load_universe_cache()
+if universe is None:
+    st.info("Open the Screens page once to build the fundamentals cache.")
+else:
+    fundamentals = portfolio_fundamentals(holdings, universe)
+    nalanda = fundamentals[fundamentals["Metric"] == "Nalanda's F (ROCE ex-cash)"].iloc[0]
+    f1, f2 = st.columns(2)
+    f1.metric("Median Nalanda's F", f"{nalanda['Median']:.2f}%" if pd.notna(nalanda["Median"]) else "—")
+    f2.metric("Weighted Nalanda's F", f"{nalanda['Weighted Avg']:.2f}%" if pd.notna(nalanda["Weighted Avg"]) else "—")
+    st.dataframe(
+        fundamentals.style.format({"Median": "{:.2f}", "Weighted Avg": "{:.2f}"}, na_rep="—"),
+        use_container_width=True,
+        hide_index=True,
+    )
+    st.caption(
+        "Latest completed FY. Weighted by Current Value. Holdings missing a value are excluded per metric."
+    )
 
 st.markdown("**Allocation**")
 allocation = holdings.sort_values("Current Value", ascending=False).set_index("Symbol")["Current Value"]

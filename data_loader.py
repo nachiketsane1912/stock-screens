@@ -84,6 +84,20 @@ def parse_metric_periods(columns) -> dict[str, list[tuple[str, str]]]:
     return blocks
 
 
+def annual_period_labels(sheets: dict[str, pd.DataFrame], years: int = 10) -> list[str]:
+    """Real fiscal-year labels ('FY26', 'FY25', ...) for the `years` most
+    recent annual periods, most-recent-first. Derived once from the `IS`
+    sheet's own Rev-* column headers (parse_metric_periods groups the whole
+    sheet's columns, not one company's row) rather than per company, since
+    every company's Y1..Y10 line up to the same real FY across the universe
+    (confirmed: IS's Rev-* and BS's Borr-* periods are identical). Returns
+    fewer than `years` entries only if the sheet itself has less than
+    `years` years of data.
+    """
+    periods = parse_metric_periods(sheets["IS"].columns[1:]).get("Rev", [])
+    return [f"FY{period}" for period, _ in periods[:years]]
+
+
 def company_metric_table(df: pd.DataFrame, symbol: str) -> pd.DataFrame:
     """Pivot one wide sheet (Quarter/IS/BS) for a single symbol into a
     metric-by-period table (rows = metric, columns = period, most-recent
@@ -413,6 +427,18 @@ def add_rev_growth(is_table: pd.DataFrame) -> pd.DataFrame:
 # already requires (ROCE/ROCEExCash are already covered via the Nalanda's F entries).
 CCP_EXTRA_CACHE_ROWS = {"RevGrowth"}
 
+# Raw (non-ratio) IS rows cached as "{row} Y1..Y10 (Cr)" for the bottom-up
+# macro rollup (Macro page) — summed across the whole universe per year, not
+# averaged per company like the MOAT_METRIC_CONFIG "(%)" rows above. `Int` is
+# not listed here since it's already cached in this shape for the Vantage
+# screen; the bottom-up rollup reuses that column as-is.
+BOTTOM_UP_IS_ROWS = ["Rev", "Exp", "OP", "Dep", "PBT", "Net", "Capex"]
+
+# Raw BS rows cached as "{row} Y1..Y10 (Cr)" for the bottom-up macro rollup —
+# Borr for the Borr-vs-NB leverage chart, NB (Net Block / Net Fixed Assets)
+# as the other half of that comparison.
+BOTTOM_UP_BS_ROWS = ["Borr", "NB"]
+
 
 def _cagr_pct(latest: float, base: float, years: float) -> float:
     """Annualized % growth from `base` to `latest` over `years`.
@@ -591,6 +617,10 @@ def build_universe_cache(
     Price/P·E/Market Cap are *not* here — `merge_market_data()` reads those
     straight from the `Market` sheet on every page load instead, since Price
     changes far more often than fundamentals do.
+    Also includes raw (non-ratio) `Y1..Y10 (Cr)` series for `BOTTOM_UP_IS_ROWS`
+    (Rev, Exp, OP, OI, Dep, PBT, Net) plus `Borr Y1..Y10 (Cr)` (a BS row) — for
+    the Macro page's bottom-up universe rollup, which sums these across every
+    company per year rather than reading one company's own value.
     """
     rows_needed = {config["row"] for config in MOAT_METRIC_CONFIG.values()} | CCP_EXTRA_CACHE_ROWS
     symbols = sheets["Industry"]["Symbol"].dropna().unique()
@@ -646,6 +676,18 @@ def build_universe_cache(
         for y in range(10):
             row[f"Int Y{y + 1} (Cr)"] = int_values[annual_cols[y]] if y < len(annual_cols) else float("nan")
             row[f"CFO Y{y + 1} (Cr)"] = cfo_values[annual_bs_cols[y]] if y < len(annual_bs_cols) else float("nan")
+
+        bottom_up_is_values = {r: _numeric_row(income_statement, r) for r in BOTTOM_UP_IS_ROWS}
+        bottom_up_bs_values = {r: _numeric_row(balance_sheet, r) for r in BOTTOM_UP_BS_ROWS}
+        for y in range(10):
+            for r in BOTTOM_UP_IS_ROWS:
+                row[f"{r} Y{y + 1} (Cr)"] = (
+                    bottom_up_is_values[r][annual_cols[y]] if y < len(annual_cols) else float("nan")
+                )
+            for r in BOTTOM_UP_BS_ROWS:
+                row[f"{r} Y{y + 1} (Cr)"] = (
+                    bottom_up_bs_values[r][annual_bs_cols[y]] if y < len(annual_bs_cols) else float("nan")
+                )
         rows.append(row)
 
         if progress_callback and (i % 25 == 0 or i == total - 1):
@@ -763,6 +805,65 @@ def portfolio_weighted_pe(holdings: pd.DataFrame) -> float:
     return float((usable["Current Value"] * usable["PE"]).sum() / total_value)
 
 
+PORTFOLIO_FUNDAMENTAL_METRICS = [
+    ("Returns", "Nalanda's F (ROCE ex-cash)", "ROCEExCash Y1 (%)"),
+    ("Returns", "ROCE", "ROCE Y1 (%)"),
+    ("Returns", "ROE", "ROE Y1 (%)"),
+    ("Margins", "OPM", "OPM Y1 (%)"),
+    ("Margins", "NPM", "NPM Y1 (%)"),
+    ("Growth", "Revenue 10Y CAGR", "Rev 10Y CAGR (%)"),
+    ("Growth", "Net Profit 10Y CAGR", "Net 10Y CAGR (%)"),
+    ("Growth", "SSGR", "SSGR (%)"),
+    ("Balance sheet", "Debt/Equity", "DebtEquity Latest (%)"),
+    ("Balance sheet", "Interest Coverage", "InterestCoverage Latest (x)"),
+    ("Balance sheet", "Current Ratio", "CurrentRatio Latest (x)"),
+]
+
+PORTFOLIO_FUNDAMENTALS_COLUMNS = ["Group", "Metric", "Median", "Weighted Avg", "Coverage"]
+
+
+def portfolio_fundamentals(holdings: pd.DataFrame, universe: pd.DataFrame) -> pd.DataFrame:
+    """Aggregate each `PORTFOLIO_FUNDAMENTAL_METRICS` entry across the
+    portfolio's holdings: the plain median and the Current Value-weighted
+    average of that metric's latest-year value, plus a `Coverage` string
+    ("7 of 9 holdings") showing how many holdings had a usable value.
+
+    Per metric, holdings with a missing value (including a symbol absent from
+    `universe`) or a non-positive Current Value are excluded, and weights are
+    renormalized over the remaining subset — same convention as
+    portfolio_weighted_pe, so one missing company doesn't null the whole row.
+    """
+    columns = [col for _, _, col in PORTFOLIO_FUNDAMENTAL_METRICS if col in universe.columns]
+    merged = holdings[["Symbol", "Current Value"]].merge(
+        universe[["Symbol", *columns]], on="Symbol", how="left"
+    )
+    merged["Current Value"] = pd.to_numeric(merged["Current Value"], errors="coerce")
+
+    rows = []
+    for group, label, col in PORTFOLIO_FUNDAMENTAL_METRICS:
+        values = pd.to_numeric(merged[col], errors="coerce") if col in merged.columns else pd.Series(
+            float("nan"), index=merged.index
+        )
+        usable = pd.DataFrame({"value": values, "weight": merged["Current Value"]}).dropna()
+        usable = usable[usable["weight"] > 0]
+
+        if usable.empty:
+            median = weighted = float("nan")
+        else:
+            median = float(usable["value"].median())
+            weighted = float((usable["value"] * usable["weight"]).sum() / usable["weight"].sum())
+
+        rows.append({
+            "Group": group,
+            "Metric": label,
+            "Median": median,
+            "Weighted Avg": weighted,
+            "Coverage": f"{len(usable)} of {len(holdings)} holdings",
+        })
+
+    return pd.DataFrame(rows, columns=PORTFOLIO_FUNDAMENTALS_COLUMNS)
+
+
 def industry_metric_thresholds(
     universe: pd.DataFrame,
     row: str,
@@ -785,6 +886,28 @@ def industry_metric_thresholds(
     else:
         basis = universe[f"{row} Y1 (%)"]
     grouped = basis.groupby(universe["Industry"])
+    counts = grouped.transform("count")
+    thresholds = grouped.transform(lambda s: s.quantile(percentile))
+    return thresholds.where(counts >= min_companies, fallback)
+
+
+def industry_scalar_thresholds(
+    universe: pd.DataFrame,
+    column: str,
+    percentile: float,
+    min_companies: int = 5,
+    fallback: float = 0.0,
+) -> pd.Series:
+    """Per-company (aligned to universe.index) threshold: the `percentile`th
+    percentile of `column`'s value among companies sharing that row's
+    Industry, or `fallback` when that industry has fewer than `min_companies`
+    companies with a usable value. The scalar-column counterpart of
+    industry_metric_thresholds — for an already-computed single value per
+    company (e.g. a 10Y CAGR) rather than a Y1..Y10 consistency history, so
+    there's no "median" vs "all_years" basis to choose between.
+    """
+    values = pd.to_numeric(universe[column], errors="coerce")
+    grouped = values.groupby(universe["Industry"])
     counts = grouped.transform("count")
     thresholds = grouped.transform(lambda s: s.quantile(percentile))
     return thresholds.where(counts >= min_companies, fallback)
@@ -963,6 +1086,75 @@ def weighted_average_by_year(universe: pd.DataFrame, row_prefix: str, unit: str,
     weighted_sum = sum(values[col] * w for col, w in zip(cols, weights))
     result = weighted_sum / sum(weights)
     return result.where(has_full_history)
+
+
+def aggregate_universe_by_year(universe: pd.DataFrame, row: str, unit: str, years: int = 10) -> pd.Series:
+    """Sum `{row} Y1 ({unit})`..`{row} Y{years} ({unit})` down each year's
+    column, across every company that reports a value that year —
+    sum(skipna=True), so a company missing that particular year (or with
+    less than a full `years`-year history) simply doesn't contribute to it,
+    rather than the year being dropped or the company excluded entirely.
+    Column-wise counterpart to weighted_average_by_year()'s row-wise
+    per-company average: this sums one year's column across companies,
+    that averages one company's own years together. Returns a `years`-length
+    Series indexed "Y1".."Y{years}" (Y1 = latest completed FY).
+    """
+    cols = [f"{row} Y{y} ({unit})" for y in range(1, years + 1)]
+    values = universe[cols].apply(pd.to_numeric, errors="coerce")
+    result = values.sum(skipna=True)
+    result.index = [f"Y{y}" for y in range(1, years + 1)]
+    return result
+
+
+def _fy_index(period_labels: list[str], years: int) -> list[str]:
+    """Chronological (oldest-first) index of `years` real FY labels, padded
+    with a relative "Y{i}" placeholder if `period_labels` (from
+    annual_period_labels) has fewer than `years` entries — only possible if
+    the workbook itself has less than `years` years of annual data.
+    """
+    padded = period_labels + [f"Y{i}" for i in range(len(period_labels) + 1, years + 1)]
+    return list(reversed(padded[:years]))
+
+
+def bottom_up_aggregate_table(universe: pd.DataFrame, period_labels: list[str], years: int = 10) -> pd.DataFrame:
+    """Universe-wide 'bottom-up macro' rollup: sum Rev/Exp/OP/Int/Dep/PBT/Net/Capex
+    across every company, per fiscal year (aggregate_universe_by_year), then
+    derive OPM/NPM/CapexIntensity from those summed totals — sum(OP)/sum(Rev)*100,
+    sum(Net)/sum(Rev)*100, sum(Capex)/sum(Rev)*100 — NOT an average of each
+    company's own OPM/NPM/CapexIntensity.
+    Returns one row per fiscal year, chronological (oldest first, so a line
+    chart reads left-to-right as a time trend — build_trend_frame's same
+    convention), columns Rev, Exp, OP, OPM, Int, Dep, PBT, Net, NPM, Capex,
+    CapexIntensity. Row labels are the real fiscal years from `period_labels`
+    (see annual_period_labels) — Y1 in the cache always lines up to the same
+    real FY across the whole universe, so there's no need for a relative label.
+    """
+    sums = {row: aggregate_universe_by_year(universe, row, "Cr", years) for row in [*BOTTOM_UP_IS_ROWS, "Int"]}
+    table = pd.DataFrame(sums)
+    table["OPM"] = _safe_divide(table["OP"], table["Rev"]) * 100
+    table["NPM"] = _safe_divide(table["Net"], table["Rev"]) * 100
+    table["CapexIntensity"] = _safe_divide(table["Capex"], table["Rev"]) * 100
+    table = table[["Rev", "Exp", "OP", "OPM", "Int", "Dep", "PBT", "Net", "NPM", "Capex", "CapexIntensity"]]
+    table = table.iloc[::-1]
+    table.index = _fy_index(period_labels, years)
+    return table
+
+
+def bottom_up_borr_vs_nb(universe: pd.DataFrame, period_labels: list[str], years: int = 10) -> pd.DataFrame:
+    """Aggregate Borrowings vs Net Block (Net Fixed Assets) — both BS rows,
+    universe-wide, per fiscal year: the standard "how much debt vs. how much
+    fixed-asset base backs it" leverage comparison. Feeds the Borr-vs-NB
+    grouped bar chart. Kept separate from bottom_up_aggregate_table since both
+    rows here are BS, not part of that IS-only rollup; same chronological
+    real-FY-label shape (see bottom_up_aggregate_table).
+    """
+    table = pd.DataFrame({
+        "Borr": aggregate_universe_by_year(universe, "Borr", "Cr", years),
+        "NB": aggregate_universe_by_year(universe, "NB", "Cr", years),
+    })
+    table = table.iloc[::-1]
+    table.index = _fy_index(period_labels, years)
+    return table
 
 
 def vantage_metrics(universe: pd.DataFrame, decay: float, rate: float, years: int = 10) -> pd.DataFrame:
@@ -1461,6 +1653,23 @@ def macro_trend_frame(table: pd.DataFrame, columns: list[str]) -> pd.DataFrame:
     """
     chronological = list(reversed(table.index))
     data = {col: _numeric_column(table, col).reindex(chronological) for col in columns}
+    return pd.DataFrame(data, index=chronological)
+
+
+def macro_yoy_frame(table: pd.DataFrame, columns: list[str], periods_back: int = 12) -> pd.DataFrame:
+    """Year-over-year (or, for a different `periods_back`, N-period) % change
+    of selected macro_table columns, in chronological (oldest-first) order for
+    a line chart — the % analogue of macro_trend_frame. Each date's value is
+    compared to the reading `periods_back` rows earlier in this monthly sheet
+    (12 = a year ago); NaN wherever that earlier reading doesn't exist yet — a
+    gap that closes on its own as more months are appended to the Macro sheet.
+    """
+    chronological = list(reversed(table.index))
+    data = {}
+    for col in columns:
+        values = _numeric_column(table, col).reindex(chronological)
+        prior = values.shift(periods_back)
+        data[col] = _safe_divide(values - prior, prior) * 100
     return pd.DataFrame(data, index=chronological)
 
 

@@ -12,6 +12,7 @@ from data_loader import (
     and_tri_state,
     build_universe_cache,
     industry_metric_thresholds,
+    industry_scalar_thresholds,
     load_raw,
     load_universe_cache,
     magic_formula_ranking,
@@ -405,6 +406,47 @@ def render_vijay_malik_tab(universe: pd.DataFrame) -> None:
     )
     drill_through(event, passing)
 
+    st.markdown("**Industry-relative growth cutoffs**")
+    st.caption(
+        "A separate calculation: Sales CAGR and Net Profit CAGR use each company's own industry's "
+        "75th-percentile CAGR instead of the fixed sliders above, falling back to those same sliders' "
+        "values for industries with fewer than 5 peers with usable data. Debt/Equity, CFO, and Market "
+        "Cap are unchanged from above."
+    )
+
+    industry_thresholds = dict(thresholds)
+    industry_thresholds["sales_cagr"] = industry_scalar_thresholds(
+        universe, "Rev 10Y CAGR (%)", 0.75, fallback=thresholds["sales_cagr"]
+    )
+    industry_thresholds["net_cagr"] = industry_scalar_thresholds(
+        universe, "Net 10Y CAGR (%)", 0.75, fallback=thresholds["net_cagr"]
+    )
+    _industry_per_check, industry_combined = vijay_malik_passes(universe, industry_thresholds)
+
+    industry_search = st.text_input("Search by symbol or industry", key="vijay_malik_industry_search")
+    industry_passing = universe[industry_combined == True].copy()  # noqa: E712 (NA/False must not match)
+    if industry_search:
+        mask = industry_passing["Symbol"].str.contains(industry_search, case=False, na=False) | industry_passing[
+            "Industry"
+        ].str.contains(industry_search, case=False, na=False)
+        industry_passing = industry_passing[mask]
+
+    st.caption(f"**{len(industry_passing)}** of {len(universe)} companies pass")
+
+    industry_display = industry_passing[display_cols].copy()
+    industry_display["Sales CAGR Threshold Used (%)"] = industry_thresholds["sales_cagr"].loc[industry_passing.index].round(2)
+    industry_display["Net Profit CAGR Threshold Used (%)"] = industry_thresholds["net_cagr"].loc[industry_passing.index].round(2)
+
+    event2 = st.dataframe(
+        industry_display,
+        use_container_width=True,
+        hide_index=True,
+        on_select="rerun",
+        selection_mode="single-row",
+        key="vijay_malik_industry_table",
+    )
+    drill_through(event2, industry_passing)
+
 
 def render_vijay_malik_pro_tab(universe: pd.DataFrame) -> None:
     """Vijay Malik Pro: a more detailed, 9-check version of the checklist,
@@ -494,6 +536,52 @@ def render_vijay_malik_pro_tab(universe: pd.DataFrame) -> None:
         key="vmpro_table",
     )
     drill_through(event, filtered)
+
+    st.markdown("**Industry-relative growth cutoffs**")
+    st.caption(
+        "A separate calculation: Sales CAGR and Net Profit CAGR use each company's own industry's "
+        "75th-percentile CAGR instead of the fixed thresholds above, falling back to those same values "
+        "for industries with fewer than 5 peers with usable data. The other 7 checks are unchanged."
+    )
+
+    industry_thresholds = dict(thresholds)
+    industry_thresholds["sales_cagr"] = industry_scalar_thresholds(
+        universe, "Rev 10Y CAGR (%)", 0.75, fallback=thresholds["sales_cagr"]
+    )
+    industry_thresholds["net_cagr"] = industry_scalar_thresholds(
+        universe, "Net 10Y CAGR (%)", 0.75, fallback=thresholds["net_cagr"]
+    )
+    industry_per_check = vijay_malik_pro_passes(universe, industry_thresholds)
+
+    industry_ranking = universe[["Symbol", "Industry"]].copy()
+    industry_ranking["Score"] = moat_score(industry_per_check)
+    for check in VIJAY_MALIK_PRO_CHECKS:
+        industry_ranking[check["label"]] = industry_per_check[check["key"]]
+    industry_ranking = industry_ranking.sort_values(["Score", "Symbol"], ascending=[False, True])
+
+    industry_search = st.text_input("Search by symbol or industry", key="vmpro_industry_search")
+    industry_min_score = st.slider(
+        "Minimum score", min_value=0, max_value=len(VIJAY_MALIK_PRO_CHECKS), value=0, key="vmpro_industry_min_score"
+    )
+
+    industry_filtered = industry_ranking[industry_ranking["Score"] >= industry_min_score]
+    if industry_search:
+        mask = industry_filtered["Symbol"].str.contains(industry_search, case=False, na=False) | industry_filtered[
+            "Industry"
+        ].str.contains(industry_search, case=False, na=False)
+        industry_filtered = industry_filtered[mask]
+
+    st.caption(f"{len(industry_filtered)} of {len(industry_ranking)} companies")
+
+    event2 = st.dataframe(
+        industry_filtered,
+        use_container_width=True,
+        hide_index=True,
+        on_select="rerun",
+        selection_mode="single-row",
+        key="vmpro_industry_table",
+    )
+    drill_through(event2, industry_filtered)
 
 
 def render_net_net_tab(universe: pd.DataFrame) -> None:
