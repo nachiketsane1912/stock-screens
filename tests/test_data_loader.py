@@ -43,7 +43,9 @@ from data_loader import (
     net_net_passes,
     pmi_status,
     portfolio_view,
+    PORTFOLIO_VIEW_COLUMNS,
     portfolio_fundamentals,
+    portfolio_industry_exposure,
     portfolio_weighted_pe,
     save_universe_cache,
     scalar_metric_passes,
@@ -680,6 +682,34 @@ def test_portfolio_weighted_pe_nan_when_no_usable_pe():
     })
 
     assert pd.isna(portfolio_weighted_pe(holdings))
+
+
+# --- portfolio_industry_exposure ---------------------------------------------------
+
+def test_portfolio_industry_exposure_groups_and_weights():
+    holdings = pd.DataFrame({
+        "Symbol": ["AAA", "BBB", "CCC"],
+        "Industry": ["Banks", "Banks", "IT"],
+        "Invested": [500.0, 300.0, 200.0],
+        "Current Value": [600.0, 200.0, 200.0],
+        "Gain/Loss": [100.0, -100.0, 0.0],
+    })
+
+    result = portfolio_industry_exposure(holdings)
+
+    assert list(result["Industry"]) == ["Banks", "IT"]  # sorted by Current Value desc
+    banks = result.iloc[0]
+    assert banks["Holdings"] == 2
+    assert banks["Current Value"] == pytest.approx(800.0)
+    assert banks["Weight (%)"] == pytest.approx(80.0)
+    assert banks["Gain (%)"] == pytest.approx(0.0)  # (100 - 100) / 800, not an average of holdings
+    assert result["Weight (%)"].sum() == pytest.approx(100.0)
+
+
+def test_portfolio_industry_exposure_empty_holdings():
+    result = portfolio_industry_exposure(pd.DataFrame(columns=PORTFOLIO_VIEW_COLUMNS))
+
+    assert result.empty
 
 
 # --- portfolio_fundamentals --------------------------------------------------------

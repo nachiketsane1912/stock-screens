@@ -1,7 +1,14 @@
 import pandas as pd
 import streamlit as st
 
-from data_loader import load_raw, load_universe_cache, portfolio_fundamentals, portfolio_view, portfolio_weighted_pe
+from data_loader import (
+    load_raw,
+    load_universe_cache,
+    portfolio_fundamentals,
+    portfolio_industry_exposure,
+    portfolio_view,
+    portfolio_weighted_pe,
+)
 
 st.title("Portfolio")
 
@@ -56,6 +63,19 @@ else:
 st.markdown("**Allocation**")
 allocation = holdings.sort_values("Current Value", ascending=False).set_index("Symbol")["Current Value"]
 st.bar_chart(allocation)
+
+st.markdown("**Industry exposure**")
+exposure = portfolio_industry_exposure(holdings)
+top = exposure.iloc[0]
+e1, e2 = st.columns(2)
+e1.metric("Industries", f"{len(exposure)}")
+e2.metric("Largest industry", f"{top['Industry']} ({top['Weight (%)']:.1f}%)" if pd.notna(top["Weight (%)"]) else "—")
+st.bar_chart(exposure.set_index("Industry")["Weight (%)"])
+st.dataframe(
+    exposure.style.format({"Current Value": "{:,.2f}", "Weight (%)": "{:.2f}", "Gain (%)": "{:.2f}"}, na_rep="—"),
+    use_container_width=True,
+    hide_index=True,
+)
 
 st.markdown("**Holdings**")
 search = st.text_input("Search by symbol or industry")

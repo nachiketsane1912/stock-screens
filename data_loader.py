@@ -805,6 +805,40 @@ def portfolio_weighted_pe(holdings: pd.DataFrame) -> float:
     return float((usable["Current Value"] * usable["PE"]).sum() / total_value)
 
 
+PORTFOLIO_INDUSTRY_COLUMNS = ["Industry", "Holdings", "Current Value", "Weight (%)", "Gain (%)"]
+
+
+def portfolio_industry_exposure(holdings: pd.DataFrame) -> pd.DataFrame:
+    """One row per Industry across the portfolio: number of holdings, summed
+    Current Value, that Industry's share of the portfolio's total Current Value
+    (`Weight (%)`), and its combined `Gain (%)` (summed Gain/Loss over summed
+    Invested — not an average of each holding's own Gain (%)). Sorted by
+    Current Value descending. Empty (with PORTFOLIO_INDUSTRY_COLUMNS) if
+    `holdings` is empty.
+    """
+    if holdings.empty:
+        return pd.DataFrame(columns=PORTFOLIO_INDUSTRY_COLUMNS)
+
+    grouped = holdings.groupby("Industry", as_index=False).agg(
+        Holdings=("Symbol", "count"),
+        **{
+            "Current Value": ("Current Value", "sum"),
+            "Invested": ("Invested", "sum"),
+            "Gain/Loss": ("Gain/Loss", "sum"),
+        },
+    )
+
+    total_value = grouped["Current Value"].sum()
+    if pd.notna(total_value) and total_value != 0:
+        grouped["Weight (%)"] = (grouped["Current Value"] / total_value * 100).round(2)
+    else:
+        grouped["Weight (%)"] = float("nan")
+    grouped["Gain (%)"] = (_safe_divide(grouped["Gain/Loss"], grouped["Invested"]) * 100).round(2)
+
+    grouped = grouped.sort_values("Current Value", ascending=False).reset_index(drop=True)
+    return grouped[PORTFOLIO_INDUSTRY_COLUMNS]
+
+
 PORTFOLIO_FUNDAMENTAL_METRICS = [
     ("Returns", "Nalanda's F (ROCE ex-cash)", "ROCEExCash Y1 (%)"),
     ("Returns", "ROCE", "ROCE Y1 (%)"),
