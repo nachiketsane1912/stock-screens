@@ -362,8 +362,8 @@ def render_vijay_malik_tab(universe: pd.DataFrame) -> None:
         "debt_equity": ("Max Debt/Equity (%, 100 = 1.0x)", 0, 300),
     }
     number_specs = {
-        "cfo": ("Min CFO, latest year (₹ Cr)", 0.0),
-        "market_cap": ("Min Market Cap (₹ Cr)", 500.0),
+        "cfo": ("Min CFO, latest year (₹ Cr)", 10.0, 10.0),
+        "market_cap": ("Min Market Cap (₹ Cr)", 500.0, None),
     }
 
     thresholds = {}
@@ -375,8 +375,8 @@ def render_vijay_malik_tab(universe: pd.DataFrame) -> None:
 
     number_cols = st.columns(2)
     for col, key in zip(number_cols, number_specs):
-        label, default = number_specs[key]
-        thresholds[key] = col.number_input(label, value=default, step=10.0, key=f"vm_{key}")
+        label, default, min_value = number_specs[key]
+        thresholds[key] = col.number_input(label, value=default, min_value=min_value, step=10.0, key=f"vm_{key}")
 
     # Shadow-copy into plain keys, same fix as render_threshold_controls/render_ccp_tab,
     # so the Data Explorer Filters section reads the current setting reliably.
@@ -495,9 +495,11 @@ def render_vijay_malik_pro_tab(universe: pd.DataFrame) -> None:
             else:
                 unit = check["unit"].strip()
                 step = 10.0 if unit == "Cr" else 0.25
+                min_value = 10.0 if key == "cfo" else None
                 value = control_col.number_input(
                     f"Threshold ({unit})",
                     value=float(check["default"]),
+                    min_value=min_value,
                     step=step,
                     key=f"vmpro_{key}",
                     label_visibility="collapsed",
@@ -515,7 +517,7 @@ def render_vijay_malik_pro_tab(universe: pd.DataFrame) -> None:
 
     search = st.text_input("Search by symbol or industry", key="vmpro_search")
     min_score = st.slider(
-        "Minimum score", min_value=0, max_value=len(VIJAY_MALIK_PRO_CHECKS), value=0, key="vmpro_min_score"
+        "Minimum score", min_value=0, max_value=len(VIJAY_MALIK_PRO_CHECKS), value=8, key="vmpro_min_score"
     )
 
     filtered = ranking[ranking["Score"] >= min_score]
@@ -561,7 +563,7 @@ def render_vijay_malik_pro_tab(universe: pd.DataFrame) -> None:
 
     industry_search = st.text_input("Search by symbol or industry", key="vmpro_industry_search")
     industry_min_score = st.slider(
-        "Minimum score", min_value=0, max_value=len(VIJAY_MALIK_PRO_CHECKS), value=0, key="vmpro_industry_min_score"
+        "Minimum score", min_value=0, max_value=len(VIJAY_MALIK_PRO_CHECKS), value=8, key="vmpro_industry_min_score"
     )
 
     industry_filtered = industry_ranking[industry_ranking["Score"] >= industry_min_score]
@@ -598,10 +600,16 @@ def render_net_net_tab(universe: pd.DataFrame) -> None:
         "Receivables (a more conservative basis)."
     )
 
-    min_mcap = st.number_input("Min Market Cap (₹ Cr)", value=0.0, step=10.0, key="net_net_min_mcap")
+    mcap_cols = st.columns(2)
+    min_mcap = mcap_cols[0].number_input("Min Market Cap (₹ Cr)", value=0.0, step=10.0, key="net_net_min_mcap")
+    max_mcap = mcap_cols[1].number_input(
+        "Max Market Cap (₹ Cr, 0 = no max)", value=0.0, step=10.0, key="net_net_max_mcap"
+    )
 
     # Shadow-copy into a plain key, same fix as render_threshold_controls/render_ccp_tab,
     # so the Data Explorer page's Filters section reads the current setting reliably.
+    # Max Market Cap has no such copy — it's a page-display filter only, not part of
+    # the actual screen, so nothing else needs to read it.
     st.session_state["net_net_min_mcap_saved"] = min_mcap
 
     mcap_series = pd.to_numeric(universe["Market Cap (Cr)"], errors="coerce")
@@ -621,6 +629,9 @@ def render_net_net_tab(universe: pd.DataFrame) -> None:
             (passing[ncav_col] - passing["Market Cap (Cr)"]) / passing[ncav_col] * 100
         ).round(2)
         passing = passing.sort_values("Discount to NCAV (%)", ascending=False)
+
+        if max_mcap > 0:
+            passing = passing[pd.to_numeric(passing["Market Cap (Cr)"], errors="coerce") <= max_mcap]
 
         if search:
             mask = passing["Symbol"].str.contains(search, case=False, na=False) | passing[
@@ -719,12 +730,18 @@ def render_magic_formula_tab(universe: pd.DataFrame) -> None:
         "whether Working Capital excludes cash."
     )
 
-    min_market_cap = st.number_input(
+    mcap_cols = st.columns(2)
+    min_market_cap = mcap_cols[0].number_input(
         "Min Market Cap (₹ Cr)", value=5000.0, step=10.0, key="magic_formula_min_market_cap"
+    )
+    max_market_cap = mcap_cols[1].number_input(
+        "Max Market Cap (₹ Cr, 0 = no max)", value=0.0, step=10.0, key="magic_formula_max_market_cap"
     )
 
     # Shadow-copy into a plain key, same fix as every other screen's controls,
     # so the Data Explorer page's Filters section reads the current setting reliably.
+    # Max Market Cap has no such copy — it's a page-display filter only, not part of
+    # the actual screen (every company's Magic Rank is computed from Min alone).
     st.session_state["magic_formula_min_market_cap_saved"] = min_market_cap
 
     lists = [
@@ -734,9 +751,15 @@ def render_magic_formula_tab(universe: pd.DataFrame) -> None:
     for label, roc_column in lists:
         st.markdown(f"#### {label}")
         ranked = magic_formula_ranking(universe, roc_column, min_market_cap)
-        top10 = ranked.head(10)
-
         st.caption(f"Top 10 of **{len(ranked)}** eligible companies")
+
+        display_ranked = ranked
+        if max_market_cap > 0:
+            display_ranked = display_ranked[
+                pd.to_numeric(display_ranked["Market Cap (Cr)"], errors="coerce") <= max_market_cap
+            ]
+            st.caption(f"Showing top {min(10, len(display_ranked))} of {len(display_ranked)} after the Max Market Cap display filter")
+        top10 = display_ranked.head(10)
 
         display_cols = ["Symbol", "Industry", "Earnings Yield (%)", "ROC (%)", "EY Rank", "ROC Rank", "Total Rank", "Magic Rank"]
         event = st.dataframe(

@@ -1008,7 +1008,7 @@ VIJAY_MALIK_CHECKS = [
     {"key": "sales_cagr", "label": "Sales CAGR (10Y)", "column": "Rev 10Y CAGR (%)", "direction": "higher", "unit": "%", "default": 15.0},
     {"key": "net_cagr", "label": "Net Profit CAGR (10Y)", "column": "Net 10Y CAGR (%)", "direction": "higher", "unit": "%", "default": 30.0},
     {"key": "debt_equity", "label": "Debt/Equity", "column": "DebtEquity Latest (%)", "direction": "lower", "unit": "%", "default": 100.0},
-    {"key": "cfo", "label": "CFO (Latest Year)", "column": "CFO Latest (Cr)", "direction": "higher", "unit": " Cr", "default": 0.0},
+    {"key": "cfo", "label": "CFO (Latest Year)", "column": "CFO Latest (Cr)", "direction": "higher", "unit": " Cr", "default": 10.0},
     {"key": "market_cap", "label": "Market Cap", "column": "Market Cap (Cr)", "direction": "higher", "unit": " Cr", "default": 500.0},
 ]
 
@@ -1045,7 +1045,7 @@ VIJAY_MALIK_PRO_CHECKS = [
     {"key": "npm", "type": "consistency", "label": "NPM (every year)", "row": "NPM", "direction": "higher", "unit": "%", "default": 8.0},
     {"key": "net_cagr", "type": "scalar", "label": "Net Profit CAGR (10Y)", "column": "Net 10Y CAGR (%)", "direction": "higher", "unit": "%", "default": 30.0},
     {"key": "debt_equity", "type": "scalar", "label": "Debt/Equity", "column": "DebtEquity Latest (%)", "direction": "lower", "unit": "%", "default": 50.0},
-    {"key": "cfo", "type": "consistency", "label": "CFO (every year positive)", "row": "CFO", "direction": "higher", "unit": "Cr", "default": 0.0},
+    {"key": "cfo", "type": "consistency", "label": "CFO (every year positive)", "row": "CFO", "direction": "higher", "unit": "Cr", "default": 10.0},
     {"key": "market_cap", "type": "scalar", "label": "Market Cap", "column": "Market Cap (Cr)", "direction": "higher", "unit": " Cr", "default": 25.0},
     {"key": "tax_payout", "type": "range", "label": "Tax Payout Ratio", "column": "TaxPayoutRatio Latest (%)", "unit": "%", "default_min": 20.0, "default_max": 35.0},
     {"key": "interest_coverage", "type": "scalar", "label": "Interest Coverage", "column": "InterestCoverage Latest (x)", "direction": "higher", "unit": "x", "default": 3.0},
