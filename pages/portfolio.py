@@ -1,6 +1,7 @@
 import pandas as pd
 import streamlit as st
 
+from charts import render_bar_chart
 from data_loader import (
     load_raw,
     load_universe_cache,
@@ -62,7 +63,7 @@ else:
 
 st.markdown("**Allocation**")
 allocation = holdings.sort_values("Current Value", ascending=False).set_index("Symbol")["Current Value"]
-st.bar_chart(allocation)
+render_bar_chart(allocation)
 
 st.markdown("**Industry exposure**")
 exposure = portfolio_industry_exposure(holdings)
@@ -70,7 +71,7 @@ top = exposure.iloc[0]
 e1, e2 = st.columns(2)
 e1.metric("Industries", f"{len(exposure)}")
 e2.metric("Largest industry", f"{top['Industry']} ({top['Weight (%)']:.1f}%)" if pd.notna(top["Weight (%)"]) else "—")
-st.bar_chart(exposure.set_index("Industry")["Weight (%)"])
+render_bar_chart(exposure.set_index("Industry")["Weight (%)"])
 st.dataframe(
     exposure.style.format({"Current Value": "{:,.2f}", "Weight (%)": "{:.2f}", "Gain (%)": "{:.2f}"}, na_rep="—"),
     use_container_width=True,

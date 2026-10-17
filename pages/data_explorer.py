@@ -1,6 +1,7 @@
 import pandas as pd
 import streamlit as st
 
+from charts import render_trend_chart
 from data_loader import (
     MOAT_METRIC_CONFIG,
     VIJAY_MALIK_CHECKS,
@@ -125,10 +126,7 @@ if symbol:
         with trend_cols[i % 2]:
             st.caption(title)
             frame = build_trend_frame(view["income_statement"], rows)
-            if frame.dropna(how="all").empty:
-                st.caption("Not enough history")
-            else:
-                st.line_chart(frame)
+            render_trend_chart(frame, x_field="FY", x_type="N")
 
     st.markdown("**Market**")
     market = view["market"]
