@@ -14,6 +14,7 @@ from data_loader import (
     load_universe_cache,
     merge_market_data,
 )
+from tables import style_tri_state, tri_state_column_config
 
 TREND_CHARTS = [
     ("Revenue & Operating Profit (₹ Cr)", ["Rev", "OP"]),
@@ -116,8 +117,12 @@ if symbol:
         overrides["magic_formula"] = {
             "min_market_cap": st.session_state.get("magic_formula_min_market_cap_saved", 5000.0),
         }
+        filters_table = evaluate_screens_for_company(universe, symbol, overrides)
         st.dataframe(
-            evaluate_screens_for_company(universe, symbol, overrides), use_container_width=True, hide_index=True
+            style_tri_state(filters_table, ["Passes"]),
+            use_container_width=True,
+            hide_index=True,
+            column_config=tri_state_column_config(["Passes"]),
         )
 
     st.markdown("**Trends**")
@@ -162,7 +167,17 @@ if symbol:
     st.dataframe(view["balance_sheet"], use_container_width=True)
 
     st.markdown("**CAGR (annual metrics)**")
-    st.dataframe(view["cagr"], use_container_width=True)
+    st.dataframe(
+        view["cagr"],
+        use_container_width=True,
+        column_config={col: st.column_config.NumberColumn(format="%.2f%%") for col in view["cagr"].columns},
+    )
 
     st.markdown("**Quarterly Revenue CAGR**")
-    st.dataframe(view["quarterly_cagr"], use_container_width=True)
+    st.dataframe(
+        view["quarterly_cagr"],
+        use_container_width=True,
+        column_config={
+            col: st.column_config.NumberColumn(format="%.2f%%") for col in view["quarterly_cagr"].columns
+        },
+    )

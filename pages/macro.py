@@ -3,6 +3,7 @@ import streamlit as st
 
 from charts import render_grouped_bar_chart, render_trend_chart
 from data_loader import (
+    CPI_BASKET_CATEGORIES,
     annual_period_labels,
     bottom_up_aggregate_table,
     bottom_up_borr_vs_nb,
@@ -15,6 +16,7 @@ from data_loader import (
     macro_yoy_frame,
     pmi_status,
 )
+from tables import style_diverging
 
 BOTTOM_UP_TREND_CHARTS = [
     ("Revenue, Expenses & Operating Profit (₹ Cr, aggregate)", ["Rev", "Exp", "OP"]),
@@ -66,10 +68,31 @@ for i, (title, frame) in enumerate(other_trend_charts):
 
 snapshot = macro_latest_snapshot(table)
 st.markdown("**Latest snapshot**")
-st.dataframe(snapshot, use_container_width=True, hide_index=True)
+st.dataframe(
+    style_diverging(snapshot.style, ["Change (%)"]),
+    use_container_width=True,
+    hide_index=True,
+)
 
 st.markdown("**CPI basket breakdown**")
-st.dataframe(cpi_basket_ranking(table), use_container_width=True, hide_index=True)
+basket_ranking = cpi_basket_ranking(table)
+st.dataframe(
+    style_diverging(basket_ranking.style, ["Change (%)"]),
+    use_container_width=True,
+    hide_index=True,
+    column_config={
+        "Earliest Value": st.column_config.NumberColumn(format="%.2f"),
+        "Latest Value": st.column_config.NumberColumn(format="%.2f"),
+        "Change (%)": st.column_config.NumberColumn(format="%.2f%%"),
+    },
+)
+
+with st.expander("CPI basket trends (YoY %)"):
+    basket_cols = st.columns(2)
+    for i, category in enumerate(CPI_BASKET_CATEGORIES):
+        with basket_cols[i % 2]:
+            st.caption(category)
+            render_trend_chart(macro_yoy_frame(table, [category]))
 
 st.markdown("**PMI status**")
 pmi_cols = st.columns(2)

@@ -10,6 +10,7 @@ from data_loader import (
     portfolio_view,
     portfolio_weighted_pe,
 )
+from tables import style_diverging
 
 st.title("Portfolio")
 
@@ -72,8 +73,11 @@ e1, e2 = st.columns(2)
 e1.metric("Industries", f"{len(exposure)}")
 e2.metric("Largest industry", f"{top['Industry']} ({top['Weight (%)']:.1f}%)" if pd.notna(top["Weight (%)"]) else "—")
 render_bar_chart(exposure.set_index("Industry")["Weight (%)"])
+exposure_styler = exposure.style.format(
+    {"Current Value": "{:,.2f}", "Weight (%)": "{:.2f}", "Gain (%)": "{:.2f}"}, na_rep="—"
+)
 st.dataframe(
-    exposure.style.format({"Current Value": "{:,.2f}", "Weight (%)": "{:.2f}", "Gain (%)": "{:.2f}"}, na_rep="—"),
+    style_diverging(exposure_styler, ["Gain (%)"]),
     use_container_width=True,
     hide_index=True,
 )
@@ -89,13 +93,23 @@ if search:
 
 st.caption(f"{len(filtered)} of {len(holdings)} holdings")
 
+holdings_styler = style_diverging(filtered.style, ["Gain/Loss", "Gain (%)"])
 event = st.dataframe(
-    filtered,
+    holdings_styler,
     use_container_width=True,
     hide_index=True,
     on_select="rerun",
     selection_mode="single-row",
     key="portfolio_table",
+    column_config={
+        "Invested": st.column_config.NumberColumn(format="₹ %,.2f"),
+        "CMP": st.column_config.NumberColumn(format="₹ %,.2f"),
+        "Current Value": st.column_config.NumberColumn(format="₹ %,.2f"),
+        "Gain/Loss": st.column_config.NumberColumn(format="₹ %,.2f"),
+        "Gain (%)": st.column_config.NumberColumn(format="%.2f%%"),
+        "Weight (%)": st.column_config.NumberColumn(format="%.2f%%"),
+        "PE": st.column_config.NumberColumn(format="%.2f"),
+    },
 )
 if event.selection.rows:
     st.session_state["jump_to_symbol"] = filtered.iloc[event.selection.rows[0]]["Symbol"]

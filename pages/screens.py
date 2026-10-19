@@ -26,6 +26,7 @@ from data_loader import (
     vijay_malik_passes,
     vijay_malik_pro_passes,
 )
+from tables import style_diverging, style_tri_state, tri_state_column_config
 
 st.title("Screens")
 
@@ -171,6 +172,7 @@ def render_metric_detail_table(
     display_cols = ["Symbol", "Industry", "Threshold Used (%)"] + [
         f"{row} Y{y} (%)" for y in range(1, 11)
     ] + ["Passes"]
+    percent_cols = ["Threshold Used (%)"] + [f"{row} Y{y} (%)" for y in range(1, 11)]
     event = st.dataframe(
         filtered[display_cols],
         use_container_width=True,
@@ -178,6 +180,7 @@ def render_metric_detail_table(
         on_select="rerun",
         selection_mode="single-row",
         key=f"{config_key}_detail_table",
+        column_config={c: st.column_config.NumberColumn(format="%.2f%%") for c in percent_cols},
     )
     drill_through(event, filtered)
 
@@ -224,6 +227,9 @@ def render_screen_group_tab(universe: pd.DataFrame, title: str, description: str
         on_select="rerun",
         selection_mode="single-row",
         key=f"{key_prefix}_table",
+        column_config={
+            "Score": st.column_config.ProgressColumn(min_value=0, max_value=len(group_configs), format="%d")
+        },
     )
     drill_through(event_rank, filtered_rank)
 
@@ -261,6 +267,7 @@ def render_filter_tab(universe: pd.DataFrame, title: str, description: str, grou
 
         row = config["row"]
         display_cols = ["Symbol", "Industry", "Threshold Used (%)"] + [f"{row} Y{y} (%)" for y in range(1, 11)]
+        percent_cols = ["Threshold Used (%)"] + [f"{row} Y{y} (%)" for y in range(1, 11)]
         event = st.dataframe(
             passing[display_cols],
             use_container_width=True,
@@ -268,6 +275,7 @@ def render_filter_tab(universe: pd.DataFrame, title: str, description: str, grou
             on_select="rerun",
             selection_mode="single-row",
             key=f"{config_key}_filter_table",
+            column_config={c: st.column_config.NumberColumn(format="%.2f%%") for c in percent_cols},
         )
         drill_through(event, passing)
         st.divider()
@@ -327,9 +335,10 @@ def render_ccp_tab(universe: pd.DataFrame) -> None:
 
         st.caption(f"**{len(passing)}** of {len(universe)} companies pass")
 
-        display_cols = ["Symbol", "Industry"] + [f"{roce_row} Y{y} (%)" for y in range(1, years + 1)] + [
+        percent_cols = [f"{roce_row} Y{y} (%)" for y in range(1, years + 1)] + [
             f"RevGrowth Y{y} (%)" for y in range(1, years + 1)
         ]
+        display_cols = ["Symbol", "Industry"] + percent_cols
         event = st.dataframe(
             passing[display_cols],
             use_container_width=True,
@@ -337,6 +346,7 @@ def render_ccp_tab(universe: pd.DataFrame) -> None:
             on_select="rerun",
             selection_mode="single-row",
             key=f"ccp_{label}_table",
+            column_config={c: st.column_config.NumberColumn(format="%.2f%%") for c in percent_cols},
         )
         drill_through(event, passing)
         st.divider()
@@ -396,6 +406,10 @@ def render_vijay_malik_tab(universe: pd.DataFrame) -> None:
     st.caption(f"**{len(passing)}** of {len(universe)} companies pass")
 
     display_cols = ["Symbol", "Industry"] + [c["column"] for c in VIJAY_MALIK_CHECKS]
+    vm_column_config = {
+        c["column"]: st.column_config.NumberColumn(format="%.2f%%" if c["unit"].strip() == "%" else "₹ %,.2f")
+        for c in VIJAY_MALIK_CHECKS
+    }
     event = st.dataframe(
         passing[display_cols],
         use_container_width=True,
@@ -403,6 +417,7 @@ def render_vijay_malik_tab(universe: pd.DataFrame) -> None:
         on_select="rerun",
         selection_mode="single-row",
         key="vijay_malik_table",
+        column_config=vm_column_config,
     )
     drill_through(event, passing)
 
@@ -444,6 +459,11 @@ def render_vijay_malik_tab(universe: pd.DataFrame) -> None:
         on_select="rerun",
         selection_mode="single-row",
         key="vijay_malik_industry_table",
+        column_config={
+            **vm_column_config,
+            "Sales CAGR Threshold Used (%)": st.column_config.NumberColumn(format="%.2f%%"),
+            "Net Profit CAGR Threshold Used (%)": st.column_config.NumberColumn(format="%.2f%%"),
+        },
     )
     drill_through(event2, industry_passing)
 
@@ -529,13 +549,18 @@ def render_vijay_malik_pro_tab(universe: pd.DataFrame) -> None:
 
     st.caption(f"{len(filtered)} of {len(ranking)} companies")
 
+    check_labels = [check["label"] for check in VIJAY_MALIK_PRO_CHECKS]
     event = st.dataframe(
-        filtered,
+        style_tri_state(filtered, check_labels),
         use_container_width=True,
         hide_index=True,
         on_select="rerun",
         selection_mode="single-row",
         key="vmpro_table",
+        column_config={
+            "Score": st.column_config.ProgressColumn(min_value=0, max_value=len(VIJAY_MALIK_PRO_CHECKS), format="%d"),
+            **tri_state_column_config(check_labels),
+        },
     )
     drill_through(event, filtered)
 
@@ -576,12 +601,16 @@ def render_vijay_malik_pro_tab(universe: pd.DataFrame) -> None:
     st.caption(f"{len(industry_filtered)} of {len(industry_ranking)} companies")
 
     event2 = st.dataframe(
-        industry_filtered,
+        style_tri_state(industry_filtered, check_labels),
         use_container_width=True,
         hide_index=True,
         on_select="rerun",
         selection_mode="single-row",
         key="vmpro_industry_table",
+        column_config={
+            "Score": st.column_config.ProgressColumn(min_value=0, max_value=len(VIJAY_MALIK_PRO_CHECKS), format="%d"),
+            **tri_state_column_config(check_labels),
+        },
     )
     drill_through(event2, industry_filtered)
 
@@ -642,13 +671,19 @@ def render_net_net_tab(universe: pd.DataFrame) -> None:
         st.caption(f"**{len(passing)}** of {len(universe)} companies pass")
 
         display_cols = ["Symbol", "Industry", ncav_col, "Market Cap (Cr)", "Discount to NCAV (%)"]
+        net_net_table = passing[display_cols]
         event = st.dataframe(
-            passing[display_cols],
+            style_diverging(net_net_table.style, ["Discount to NCAV (%)"]),
             use_container_width=True,
             hide_index=True,
             on_select="rerun",
             selection_mode="single-row",
             key=f"net_net_{label}_table",
+            column_config={
+                ncav_col: st.column_config.NumberColumn(format="₹ %,.2f"),
+                "Market Cap (Cr)": st.column_config.NumberColumn(format="₹ %,.2f"),
+                "Discount to NCAV (%)": st.column_config.NumberColumn(format="%.2f%%"),
+            },
         )
         drill_through(event, passing)
         st.divider()
@@ -712,6 +747,13 @@ def render_vantage_tab(universe: pd.DataFrame) -> None:
         on_select="rerun",
         selection_mode="single-row",
         key="vantage_table",
+        column_config={
+            "WA CFO (Cr)": st.column_config.NumberColumn(format="₹ %,.2f"),
+            "WA Interest (Cr)": st.column_config.NumberColumn(format="₹ %,.2f"),
+            "Total Value (Cr)": st.column_config.NumberColumn(format="₹ %,.2f"),
+            "Market Cap (Cr)": st.column_config.NumberColumn(format="₹ %,.2f"),
+            "Multiple": st.column_config.NumberColumn(format="%.2f"),
+        },
     )
     drill_through(event, passing)
 
@@ -769,6 +811,10 @@ def render_magic_formula_tab(universe: pd.DataFrame) -> None:
             on_select="rerun",
             selection_mode="single-row",
             key=f"magic_formula_{label}_table",
+            column_config={
+                "Earnings Yield (%)": st.column_config.NumberColumn(format="%.2f%%"),
+                "ROC (%)": st.column_config.NumberColumn(format="%.2f%%"),
+            },
         )
         drill_through(event, top10)
         st.divider()
@@ -805,6 +851,10 @@ with tab_ssgr:
         on_select="rerun",
         selection_mode="single-row",
         key="ssgr_table",
+        column_config={
+            "SSGR (%)": st.column_config.NumberColumn(format="%.2f%%"),
+            "Rev 10Y CAGR (%)": st.column_config.NumberColumn(format="%.2f%%"),
+        },
     )
     drill_through(event, filtered)
 
