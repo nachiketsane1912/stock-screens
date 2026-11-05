@@ -439,6 +439,19 @@ BOTTOM_UP_IS_ROWS = ["Rev", "Exp", "OP", "Dep", "PBT", "Net", "Capex"]
 # as the other half of that comparison.
 BOTTOM_UP_BS_ROWS = ["Borr", "NB"]
 
+# Curated {label: row} set of already-cached quality metrics, shared by the
+# Screens page's Insights tab (Quality vs Valuation scatter) and the
+# Industries page (Industry spread) — both let the user pick which metric to
+# look at from the same options, so the choices and labels stay in sync
+# between the two pages rather than drifting apart as separate literals.
+QUALITY_METRIC_OPTIONS = {
+    "ROCE": "ROCE",
+    "Nalanda's F (ROCE ex-cash)": "ROCEExCash",
+    "ROE": "ROE",
+    "Operating Margin": "OPM",
+    "Net Margin": "NPM",
+}
+
 
 def _cagr_pct(latest: float, base: float, years: float) -> float:
     """Annualized % growth from `base` to `latest` over `years`.
