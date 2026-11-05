@@ -30,7 +30,10 @@ from data_loader import (
     evaluate_screens_for_company,
     failure_detail,
     get_company_view,
+    industry_metric_heatmap_frame,
+    industry_metric_spread_frame,
     industry_metric_thresholds,
+    industry_overview,
     industry_scalar_thresholds,
     load_universe_cache,
     macro_latest_snapshot,
@@ -42,11 +45,15 @@ from data_loader import (
     moat_score,
     net_net_passes,
     pmi_status,
+    portfolio_metric_trend,
+    portfolio_screen_overlay,
     portfolio_view,
     PORTFOLIO_VIEW_COLUMNS,
     portfolio_fundamentals,
     portfolio_industry_exposure,
     portfolio_weighted_pe,
+    relative_valuation_passes,
+    relative_valuation_scatter_frame,
     save_universe_cache,
     scalar_metric_passes,
     vantage_metrics,
@@ -1053,6 +1060,379 @@ def test_industry_scalar_thresholds_nan_value_does_not_count_toward_min_companie
     assert (result == 15.0).all()
 
 
+# --- relative_valuation_passes -----------------------------------------------------
+
+def test_relative_valuation_passes_below_industry_percentile():
+    universe = pd.DataFrame({
+        "Symbol": ["A1", "A2", "A3", "A4", "A5"],
+        "Industry": ["Big"] * 5,
+        "PE": [10.0, 20.0, 30.0, 40.0, 50.0],
+    })
+
+    passes, thresholds = relative_valuation_passes(universe, percentile=0.25)
+
+    expected_threshold = universe["PE"].quantile(0.25)
+    assert thresholds.nunique() == 1
+    assert thresholds.iloc[0] == pytest.approx(expected_threshold)
+    # Only A1 (PE 10.0) is strictly below the 25th percentile (20.0).
+    assert passes.iloc[0] is True
+    assert (passes.iloc[1:] == False).all()  # noqa: E712
+
+
+def test_relative_valuation_passes_masks_non_positive_pe():
+    universe = pd.DataFrame({
+        "Symbol": ["LOSS", "ZERO", "CHEAP"],
+        "Industry": ["Ind X"] * 3,
+        "PE": [-5.0, 0.0, 10.0],
+    })
+
+    passes, _ = relative_valuation_passes(universe)
+
+    assert pd.isna(passes.iloc[0])
+    assert pd.isna(passes.iloc[1])
+    # Alone (effectively) among usable peers -> falls back to the flat default (20.0).
+    assert passes.iloc[2] is True
+
+
+def test_relative_valuation_passes_thin_industry_falls_back_to_flat_default():
+    # Only 2 companies with usable PE, well below min_companies=5.
+    universe = pd.DataFrame({
+        "Symbol": ["CHEAP", "PRICEY"],
+        "Industry": ["Ind X"] * 2,
+        "PE": [15.0, 25.0],
+    })
+
+    passes, thresholds = relative_valuation_passes(universe, fallback=20.0)
+
+    assert (thresholds == 20.0).all()
+    assert passes.iloc[0] is True  # 15 < 20
+    assert passes.iloc[1] is False  # 25 is not < 20
+
+
+# --- relative_valuation_scatter_frame ----------------------------------------------
+
+def test_relative_valuation_scatter_frame_basic_shape():
+    universe = pd.DataFrame({
+        "Symbol": ["AAA", "BBB"],
+        "Industry": ["Ind X", "Ind X"],
+        "ROCE Y1 (%)": [18.0, 22.0],
+        "PE": [12.0, 30.0],
+        "Market Cap (Cr)": [500.0, 1500.0],
+    })
+
+    result = relative_valuation_scatter_frame(universe, "ROCE")
+
+    assert list(result["Symbol"]) == ["AAA", "BBB"]
+    assert list(result["ROCE Y1 (%)"]) == [18.0, 22.0]
+    assert list(result["PE"]) == [12.0, 30.0]
+
+
+def test_relative_valuation_scatter_frame_masks_non_positive_pe():
+    universe = pd.DataFrame({
+        "Symbol": ["LOSS", "OK"],
+        "Industry": ["Ind X", "Ind X"],
+        "ROCE Y1 (%)": [18.0, 22.0],
+        "PE": [-5.0, 12.0],
+        "Market Cap (Cr)": [500.0, 500.0],
+    })
+
+    result = relative_valuation_scatter_frame(universe, "ROCE")
+
+    # LOSS's PE is masked to NaN, so it's dropped entirely (dropna on PE).
+    assert list(result["Symbol"]) == ["OK"]
+
+
+def test_relative_valuation_scatter_frame_max_pe_filters_display_only():
+    universe = pd.DataFrame({
+        "Symbol": ["CHEAP", "PRICEY"],
+        "Industry": ["Ind X", "Ind X"],
+        "ROCE Y1 (%)": [18.0, 22.0],
+        "PE": [12.0, 80.0],
+        "Market Cap (Cr)": [500.0, 500.0],
+    })
+
+    result = relative_valuation_scatter_frame(universe, "ROCE", max_pe=50.0)
+
+    assert list(result["Symbol"]) == ["CHEAP"]
+
+    unfiltered = relative_valuation_scatter_frame(universe, "ROCE", max_pe=None)
+    assert list(unfiltered["Symbol"]) == ["CHEAP", "PRICEY"]
+
+
+# --- industry_metric_heatmap_frame --------------------------------------------------
+
+def test_industry_metric_heatmap_frame_normalizes_and_flips_direction():
+    universe = pd.DataFrame({
+        "Symbol": [f"A{i}" for i in range(5)] + [f"B{i}" for i in range(5)],
+        "Industry": ["Big"] * 5 + ["Small"] * 5,
+        "OPM Y1 (%)": [10.0, 20.0, 30.0, 40.0, 50.0] + [15.0] * 5,
+        "LowDebt Y1 (%)": [10.0, 20.0, 30.0, 40.0, 50.0] + [15.0] * 5,
+    })
+
+    result = industry_metric_heatmap_frame(
+        universe, [("OPM", "Operating Margin", "higher"), ("LowDebt", "Interest / OP", "lower")], min_companies=5
+    )
+
+    opm_big = result[(result["Industry"] == "Big") & (result["Metric"] == "Operating Margin")].iloc[0]
+    opm_small = result[(result["Industry"] == "Small") & (result["Metric"] == "Operating Margin")].iloc[0]
+    assert opm_big["Value"] == pytest.approx(30.0)  # median of 10..50
+    # Big's median (30) sits between Small's flat 15 and itself -> normalized
+    # against the {15, 30} range: higher-is-better keeps direction as-is.
+    assert opm_small["Normalized"] < opm_big["Normalized"]
+
+    debt_big = result[(result["Industry"] == "Big") & (result["Metric"] == "Interest / OP")].iloc[0]
+    debt_small = result[(result["Industry"] == "Small") & (result["Metric"] == "Interest / OP")].iloc[0]
+    # Same raw medians as OPM, but lower-is-better flips the normalization:
+    # Small (15, the lower/better value) should now normalize higher than Big (30).
+    assert debt_small["Normalized"] > debt_big["Normalized"]
+
+
+def test_industry_metric_heatmap_frame_drops_thin_industries():
+    universe = pd.DataFrame({
+        "Symbol": [f"A{i}" for i in range(5)] + ["B1", "B2"],
+        "Industry": ["Big"] * 5 + ["Small"] * 2,
+        "OPM Y1 (%)": [10.0, 20.0, 30.0, 40.0, 50.0, 60.0, 70.0],
+    })
+
+    result = industry_metric_heatmap_frame(universe, [("OPM", "Operating Margin", "higher")], min_companies=5)
+
+    assert list(result["Industry"]) == ["Big"]
+
+
+def test_industry_metric_heatmap_frame_reads_scalar_column_directly():
+    universe = pd.DataFrame({
+        "Symbol": [f"A{i}" for i in range(5)],
+        "Industry": ["Big"] * 5,
+        "SSGR (%)": [10.0, 20.0, 30.0, 40.0, 50.0],
+    })
+
+    result = industry_metric_heatmap_frame(universe, [("SSGR (%)", "SSGR", "higher")], min_companies=5)
+
+    assert result.iloc[0]["Value"] == pytest.approx(30.0)
+
+
+# --- industry_metric_spread_frame ---------------------------------------------------
+
+def test_industry_metric_spread_frame_returns_raw_rows_per_company():
+    universe = pd.DataFrame({
+        "Symbol": [f"A{i}" for i in range(5)],
+        "Industry": ["Big"] * 5,
+        "ROCE Y1 (%)": [10.0, 20.0, 30.0, 40.0, 50.0],
+    })
+
+    result = industry_metric_spread_frame(universe, "ROCE", min_companies=5)
+
+    assert len(result) == 5
+    assert set(result.columns) == {"Symbol", "Industry", "Value"}
+    assert sorted(result["Value"]) == [10.0, 20.0, 30.0, 40.0, 50.0]
+
+
+def test_industry_metric_spread_frame_drops_thin_industries():
+    universe = pd.DataFrame({
+        "Symbol": [f"A{i}" for i in range(5)] + ["B1", "B2"],
+        "Industry": ["Big"] * 5 + ["Small"] * 2,
+        "ROCE Y1 (%)": [10.0, 20.0, 30.0, 40.0, 50.0, 60.0, 70.0],
+    })
+
+    result = industry_metric_spread_frame(universe, "ROCE", min_companies=5)
+
+    assert set(result["Industry"]) == {"Big"}
+    assert len(result) == 5
+
+
+def test_industry_metric_spread_frame_drops_missing_values():
+    universe = pd.DataFrame({
+        "Symbol": [f"A{i}" for i in range(5)],
+        "Industry": ["Big"] * 5,
+        "ROCE Y1 (%)": [10.0, 20.0, float("nan"), 40.0, 50.0],
+    })
+
+    result = industry_metric_spread_frame(universe, "ROCE", min_companies=4)
+
+    assert len(result) == 4
+    assert not result["Value"].isna().any()
+
+
+# --- industry_overview --------------------------------------------------------------
+
+def _industry_overview_fixture(rows: dict) -> pd.DataFrame:
+    """Minimal industry_overview input: every column the function reads,
+    defaulted to comfortable flat values, overridable via `rows`.
+    """
+    n = len(rows["Symbol"])
+    base = {
+        "Market Cap (Cr)": [100.0] * n,
+        "OPM Y1 (%)": [20.0] * n,
+        **{f"RevGrowth Y{y} (%)": [10.0] * n for y in range(1, 7)},
+        "PE": [10.0] * n,
+    }
+    base.update(rows)
+    return pd.DataFrame(base)
+
+
+def test_industry_overview_market_cap_share_sums_to_100_and_splits_correctly():
+    universe = _industry_overview_fixture({
+        "Symbol": ["A1", "A2", "B1"],
+        "Industry": ["Alpha", "Alpha", "Beta"],
+        "Market Cap (Cr)": [700.0, 300.0, 1000.0],
+    })
+
+    result = industry_overview(universe, min_companies=1)
+
+    assert result["Market Cap Share (%)"].sum() == pytest.approx(100.0)
+    alpha_share = result.loc[result["Industry"] == "Alpha", "Market Cap Share (%)"].iloc[0]
+    assert alpha_share == pytest.approx(50.0)  # (700+300) / (700+300+1000) * 100
+
+
+def test_industry_overview_hhi_known_split():
+    universe = _industry_overview_fixture({
+        "Symbol": ["A1", "A2"],
+        "Industry": ["Solo", "Solo"],
+        "Market Cap (Cr)": [700.0, 300.0],
+    })
+
+    result = industry_overview(universe, min_companies=1)
+
+    hhi = result.loc[result["Industry"] == "Solo", "HHI"].iloc[0]
+    assert hhi == pytest.approx(5800.0)  # 70^2 + 30^2
+
+
+def test_industry_overview_growth_delta_detects_acceleration():
+    universe = _industry_overview_fixture({
+        "Symbol": [f"G{i}" for i in range(5)],
+        "Industry": ["Growing"] * 5,
+        "RevGrowth Y1 (%)": [30.0] * 5,
+        "RevGrowth Y2 (%)": [30.0] * 5,
+        "RevGrowth Y3 (%)": [30.0] * 5,
+        "RevGrowth Y4 (%)": [10.0] * 5,
+        "RevGrowth Y5 (%)": [10.0] * 5,
+        "RevGrowth Y6 (%)": [10.0] * 5,
+    })
+
+    result = industry_overview(universe)  # default min_companies=5
+
+    delta = result.loc[result["Industry"] == "Growing", "Growth Δ (pp)"].iloc[0]
+    assert delta == pytest.approx(20.0)  # 30 (recent) - 10 (prior)
+
+
+def test_industry_overview_growth_delta_nan_when_window_underpopulated():
+    prior_values = [10.0] + [float("nan")] * 4  # only 1 of 5 companies has prior-window data
+    universe = _industry_overview_fixture({
+        "Symbol": [f"N{i}" for i in range(5)],
+        "Industry": ["New"] * 5,
+        "RevGrowth Y4 (%)": prior_values,
+        "RevGrowth Y5 (%)": prior_values,
+        "RevGrowth Y6 (%)": prior_values,
+    })
+
+    result = industry_overview(universe)  # default min_companies=5; pooled prior sample is only 3
+
+    delta = result.loc[result["Industry"] == "New", "Growth Δ (pp)"].iloc[0]
+    assert pd.isna(delta)
+
+
+def test_industry_overview_growth_delta_nan_when_too_few_distinct_companies():
+    # Only 2 companies, but each has all 3 prior-window years populated — 6
+    # pooled values, which would clear a *value*-count bar of 5 even though
+    # there are only 2 real companies behind them (the bug this test guards
+    # against: an outlier-prone thin industry shouldn't look "reliable" just
+    # because years got pooled).
+    universe = _industry_overview_fixture({
+        "Symbol": ["T1", "T2"],
+        "Industry": ["Thin"] * 2,
+    })
+
+    result = industry_overview(universe)  # default min_companies=5
+
+    delta = result.loc[result["Industry"] == "Thin", "Growth Δ (pp)"].iloc[0]
+    assert pd.isna(delta)
+
+
+def test_industry_overview_median_pe_masks_non_positive():
+    universe = _industry_overview_fixture({
+        "Symbol": ["V1", "V2", "V3"],
+        "Industry": ["ValueTrap"] * 3,
+        "PE": [-5.0, 0.0, 15.0],
+    })
+
+    result = industry_overview(universe, min_companies=1)
+
+    median_pe = result.loc[result["Industry"] == "ValueTrap", "Median PE"].iloc[0]
+    assert median_pe == pytest.approx(15.0)
+
+
+def test_industry_overview_missing_market_cap_is_nan_not_zero():
+    universe = _industry_overview_fixture({
+        "Symbol": ["X1", "X2"],
+        "Industry": ["Ghost"] * 2,
+        "Market Cap (Cr)": [float("nan"), float("nan")],
+    })
+
+    result = industry_overview(universe, min_companies=1)
+
+    ghost = result.loc[result["Industry"] == "Ghost"].iloc[0]
+    assert pd.isna(ghost["Market Cap (Cr)"])
+    assert pd.isna(ghost["Market Cap Share (%)"])
+    assert pd.isna(ghost["HHI"])
+
+
+def test_industry_overview_companies_count_includes_all_regardless_of_data():
+    universe = _industry_overview_fixture({
+        "Symbol": ["M1", "M2", "M3"],
+        "Industry": ["Mixed"] * 3,
+        "Market Cap (Cr)": [100.0, 200.0, float("nan")],
+    })
+
+    result = industry_overview(universe, min_companies=1)
+
+    assert result.loc[result["Industry"] == "Mixed", "Companies"].iloc[0] == 3
+
+
+# --- portfolio_metric_trend ---------------------------------------------------------
+
+def test_portfolio_metric_trend_weighted_average_per_year():
+    holdings = pd.DataFrame({"Symbol": ["AAA", "BBB"], "Current Value": [100.0, 300.0]})
+    universe = pd.DataFrame({
+        "Symbol": ["AAA", "BBB"],
+        **{f"ROCE Y{y} (%)": [10.0, 20.0] for y in range(1, 11)},
+    })
+
+    result = portfolio_metric_trend(holdings, universe, "ROCE")
+
+    # Weighted: (100*10 + 300*20) / 400 = 17.5, same every year since both
+    # holdings are flat across all 10 years.
+    assert list(result.index) == [f"Y{y}" for y in range(1, 11)]
+    assert result.tolist() == pytest.approx([17.5] * 10)
+
+
+def test_portfolio_metric_trend_excludes_missing_and_renormalizes():
+    holdings = pd.DataFrame({"Symbol": ["AAA", "BBB", "MISSING"], "Current Value": [100.0, 300.0, 1000.0]})
+    universe = pd.DataFrame({
+        "Symbol": ["AAA", "BBB"],
+        **{f"ROCE Y{y} (%)": [10.0, 20.0] for y in range(1, 11)},
+    })
+
+    result = portfolio_metric_trend(holdings, universe, "ROCE")
+
+    # MISSING isn't in `universe` at all, so it's excluded from every year,
+    # and the remaining weights (100/300) renormalize to the same 17.5.
+    assert result.tolist() == pytest.approx([17.5] * 10)
+
+
+def test_portfolio_metric_trend_all_missing_year_is_nan():
+    holdings = pd.DataFrame({"Symbol": ["AAA"], "Current Value": [100.0]})
+    universe = pd.DataFrame({
+        "Symbol": ["AAA"],
+        **{f"ROCE Y{y} (%)": [10.0] for y in range(1, 10)},
+        "ROCE Y10 (%)": [float("nan")],
+    })
+
+    result = portfolio_metric_trend(holdings, universe, "ROCE")
+
+    assert pd.isna(result["Y10"])
+    assert result["Y1"] == pytest.approx(10.0)
+
+
 # --- scalar_metric_passes ---------------------------------------------------------
 
 def test_scalar_metric_passes_higher_direction():
@@ -1541,6 +1921,9 @@ def make_universe_df(companies: list[dict]) -> pd.DataFrame:
             "TaxPayoutRatio Latest (%)": company.get("tax_payout_ratio", 27.0),
             "InterestCoverage Latest (x)": company.get("interest_coverage", 5.0),
             "CurrentRatio Latest (x)": company.get("current_ratio", 1.5),
+            # Relative Valuation (P/E): comfortably below the 20.0 thin-industry
+            # fallback used by relative_valuation_passes.
+            "PE": company.get("pe", 10.0),
         }
         vantage_cfo = company.get("vantage_cfo", [500.0] * 10)
         vantage_int = company.get("vantage_int", [50.0] * 10)
@@ -1566,6 +1949,7 @@ def _default_overrides() -> dict:
     overrides["net_net"] = {"min_mcap": 0.0}
     overrides["vantage"] = {"decay": 0.85, "rate": 0.10, "min_threshold": 0.0, "max_threshold": 1.0}
     overrides["magic_formula"] = {"min_market_cap": 0.0}
+    overrides["relative_valuation"] = {"percentile": 0.25, "min_market_cap": 0.0}
     return overrides
 
 
@@ -1576,7 +1960,7 @@ def test_evaluate_screens_for_company_all_pass():
 
     result = evaluate_screens_for_company(universe, "PASSER", _default_overrides())
 
-    assert len(result) == 29  # SSGR + 7 moats + 4 nalanda + 2 ccp + vijay malik + 9 vm pro + 2 net-net + vantage + 2 magic formula
+    assert len(result) == 30  # SSGR + 7 moats + 4 nalanda + 2 ccp + vijay malik + 9 vm pro + 2 net-net + vantage + 2 magic formula + relative valuation
     assert (result["Passes"] == True).all()  # noqa: E712
     assert (result["Detail"] == "—").all()
 
@@ -1787,14 +2171,90 @@ def test_evaluate_screens_for_company_magic_formula_market_cap_floor():
     assert "100.00" in row["Detail"]
 
 
+def test_evaluate_screens_for_company_relative_valuation_fails_with_detail():
+    # 5 peers so the 25th-percentile threshold is a real industry figure, not
+    # the flat fallback; PRICEY's own PE (40.0) sits above it.
+    companies = [{"Symbol": f"C{i}", "Industry": "Ind X", "pe": pe} for i, pe in enumerate([10.0, 20.0, 30.0, 40.0, 50.0])]
+    universe = make_universe_df(companies)
+
+    result = evaluate_screens_for_company(universe, "C3", _default_overrides())  # PE=40.0
+
+    row = result[result["Filter"] == "Relative Valuation (P/E)"].iloc[0]
+    assert row["Passes"] == False  # noqa: E712 (a homogeneous True/False column may be bool dtype, not object)
+    assert "PE" in row["Detail"]
+    assert "percentile" in row["Detail"]
+
+
+def test_evaluate_screens_for_company_relative_valuation_not_enough_data_when_pe_missing():
+    universe = make_universe_df([{"Symbol": "NOPE", "Industry": "Ind X", "pe": float("nan")}])
+
+    result = evaluate_screens_for_company(universe, "NOPE", _default_overrides())
+
+    row = result[result["Filter"] == "Relative Valuation (P/E)"].iloc[0]
+    assert pd.isna(row["Passes"])
+    assert row["Detail"] == "not enough data"
+
+
 def test_evaluate_screens_for_company_symbol_not_in_universe():
     universe = make_universe_df([{"Symbol": "PASSER", "Industry": "Ind X"}])
 
     result = evaluate_screens_for_company(universe, "NOT_THERE", _default_overrides())
 
-    assert len(result) == 29
+    assert len(result) == 30
     assert result["Passes"].isna().all()
     assert (result["Detail"] == "not in Screens cache — click Refresh on the Screens page").all()
+
+
+# --- portfolio_screen_overlay ----------------------------------------------------
+
+def test_portfolio_screen_overlay_matches_evaluate_screens_for_company():
+    # Same "alone in its industry" shape as test_evaluate_screens_for_company_all_pass,
+    # so every screen should pass for both holdings.
+    universe = make_universe_df([
+        {"Symbol": "PASSER", "Industry": "Ind X"},
+        {"Symbol": "ALSO_GOOD", "Industry": "Ind Y"},
+    ])
+    holdings = pd.DataFrame({"Symbol": ["PASSER", "ALSO_GOOD"]})
+
+    overlay = portfolio_screen_overlay(universe, holdings, _default_overrides())
+    screen_columns = [c for c in overlay.columns if c not in ("Symbol", "Screens Passed")]
+
+    assert len(overlay) == 2
+    for symbol in ["PASSER", "ALSO_GOOD"]:
+        single = evaluate_screens_for_company(universe, symbol, _default_overrides())
+        overlay_row = overlay[overlay["Symbol"] == symbol].iloc[0]
+        for _, single_row in single.iterrows():
+            assert overlay_row[single_row["Filter"]] == single_row["Passes"] or (
+                pd.isna(overlay_row[single_row["Filter"]]) and pd.isna(single_row["Passes"])
+            )
+        assert overlay_row["Screens Passed"] == len(screen_columns)
+
+
+def test_portfolio_screen_overlay_unknown_symbol_is_all_na():
+    universe = make_universe_df([{"Symbol": "PASSER", "Industry": "Ind X"}])
+    holdings = pd.DataFrame({"Symbol": ["NOT_IN_UNIVERSE"]})
+
+    overlay = portfolio_screen_overlay(universe, holdings)
+
+    row = overlay.iloc[0]
+    screen_columns = [c for c in overlay.columns if c not in ("Symbol", "Screens Passed")]
+    assert all(pd.isna(row[c]) for c in screen_columns)
+    assert row["Screens Passed"] == 0
+
+
+def test_portfolio_screen_overlay_screens_passed_counts_true_only():
+    universe = make_universe_df([
+        {"Symbol": "MOSTLY_GOOD", "Industry": "Ind X", "market_cap": 5.0},  # fails Vijay Malik Pro's Market Cap check
+    ])
+    holdings = pd.DataFrame({"Symbol": ["MOSTLY_GOOD"]})
+
+    overlay = portfolio_screen_overlay(universe, holdings, _default_overrides())
+    screen_columns = [c for c in overlay.columns if c not in ("Symbol", "Screens Passed")]
+
+    row = overlay.iloc[0]
+    assert row["Market Cap"] == False  # noqa: E712
+    assert row["Screens Passed"] == sum(1 for c in screen_columns if row[c] == True)  # noqa: E712
+    assert row["Screens Passed"] < len(screen_columns)
 
 
 # --- macro_trend_frame ---------------------------------------------------------

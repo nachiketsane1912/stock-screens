@@ -898,6 +898,35 @@ def portfolio_fundamentals(holdings: pd.DataFrame, universe: pd.DataFrame) -> pd
     return pd.DataFrame(rows, columns=PORTFOLIO_FUNDAMENTALS_COLUMNS)
 
 
+def portfolio_metric_trend(holdings: pd.DataFrame, universe: pd.DataFrame, row: str, years: int = 10) -> pd.Series:
+    """Current Value-weighted average of `"{row} Y1 (%)"`..`"{row}
+    Y{years} (%)"` across portfolio holdings, one value per year — the
+    historical counterpart to `portfolio_fundamentals()`'s latest-year-only
+    rollup, so a holding's own trend (not just its latest snapshot) is
+    visible at the portfolio level. Per year, holdings missing a value
+    (including a symbol absent from `universe`) or with non-positive Current
+    Value are excluded and weights renormalized over the remaining subset —
+    same convention as `portfolio_fundamentals`/`portfolio_weighted_pe`.
+    Returns a Series indexed `"Y1"`..`"Y{years}"` (`Y1` = latest).
+    """
+    year_cols = [f"{row} Y{y} (%)" for y in range(1, years + 1)]
+    merged = holdings[["Symbol", "Current Value"]].merge(universe[["Symbol", *year_cols]], on="Symbol", how="left")
+    merged["Current Value"] = pd.to_numeric(merged["Current Value"], errors="coerce")
+
+    result = {}
+    for y, col in enumerate(year_cols, start=1):
+        values = pd.to_numeric(merged[col], errors="coerce")
+        usable = pd.DataFrame({"value": values, "weight": merged["Current Value"]}).dropna()
+        usable = usable[usable["weight"] > 0]
+        result[f"Y{y}"] = (
+            float((usable["value"] * usable["weight"]).sum() / usable["weight"].sum())
+            if not usable.empty
+            else float("nan")
+        )
+
+    return pd.Series(result)
+
+
 def industry_metric_thresholds(
     universe: pd.DataFrame,
     row: str,
@@ -945,6 +974,172 @@ def industry_scalar_thresholds(
     counts = grouped.transform("count")
     thresholds = grouped.transform(lambda s: s.quantile(percentile))
     return thresholds.where(counts >= min_companies, fallback)
+
+
+def industry_metric_heatmap_frame(
+    universe: pd.DataFrame, metrics: list[tuple[str, str, str]], min_companies: int = 5
+) -> pd.DataFrame:
+    """Industry x metric frame for a heatmap: for each `(row, label,
+    direction)` in `metrics`, the industry's median of that row's latest-year
+    value (`"{row} Y1 (%)"` if that column family exists, else `row` read
+    directly — so an already-scalar column like `"SSGR (%)"` works too,
+    passed as `row` itself). Industries with fewer than `min_companies`
+    usable values are dropped, same reliability bar as
+    `industry_metric_thresholds`.
+
+    Each metric's values are then min-max normalized to 0-1 *within that
+    metric's own column*, flipped for `direction="lower"` so `1.0` always
+    means "best in class" regardless of the metric's natural direction —
+    letting one sequential color scale span the whole grid meaningfully
+    despite the metrics having different units/scales.
+
+    Returns a long-format frame: Industry, Metric, Value (the real median,
+    for a tooltip), Normalized (for color) — ready for `render_heatmap_chart`.
+    """
+    rows = []
+    for row, label, direction in metrics:
+        y1_col = f"{row} Y1 (%)"
+        col = y1_col if y1_col in universe.columns else row
+        values = pd.to_numeric(universe[col], errors="coerce")
+        grouped = values.groupby(universe["Industry"])
+        counts = grouped.transform("count")
+        medians = grouped.transform("median")
+
+        usable = pd.DataFrame({"Industry": universe["Industry"], "Median": medians, "Count": counts})
+        usable = usable[usable["Count"] >= min_companies].drop_duplicates("Industry")
+        if usable.empty:
+            continue
+
+        lo, hi = usable["Median"].min(), usable["Median"].max()
+        span = hi - lo
+        if span == 0:
+            normalized = pd.Series(0.5, index=usable.index)
+        else:
+            normalized = (usable["Median"] - lo) / span
+            if direction == "lower":
+                normalized = 1 - normalized
+
+        for industry, value, norm in zip(usable["Industry"], usable["Median"], normalized):
+            rows.append({"Industry": industry, "Metric": label, "Value": round(float(value), 2), "Normalized": float(norm)})
+
+    return pd.DataFrame(rows, columns=["Industry", "Metric", "Value", "Normalized"])
+
+
+def industry_metric_spread_frame(universe: pd.DataFrame, row: str, min_companies: int = 5) -> pd.DataFrame:
+    """Symbol/Industry/Value for every company with a usable `"{row} Y1 (%)"`
+    value, restricted to industries with at least `min_companies` such
+    companies (same reliability bar as `industry_metric_thresholds`/
+    `industry_metric_heatmap_frame` — a single company can't look like
+    "divergence"). Raw, one row per company (not pre-aggregated into
+    quartiles) — ready for a box plot, whose composite mark computes its own
+    median/IQR/whiskers from these per-row values grouped by Industry.
+    """
+    col = f"{row} Y1 (%)"
+    frame = pd.DataFrame(
+        {
+            "Symbol": universe["Symbol"],
+            "Industry": universe["Industry"],
+            "Value": pd.to_numeric(universe[col], errors="coerce"),
+        }
+    ).dropna(subset=["Value"])
+
+    counts = frame.groupby("Industry")["Value"].transform("count")
+    return frame[counts >= min_companies].reset_index(drop=True)
+
+
+def _pooled_median(universe: pd.DataFrame, industries: pd.Series, columns: list[str], min_companies: int) -> pd.Series:
+    """Median of every (company, column) value in `columns`, pooled together
+    and grouped by `industries` — e.g. every company's RevGrowth Y1/Y2/Y3
+    treated as one combined sample per industry, not three separate medians.
+    `NaN` for an industry with fewer than `min_companies` *distinct companies*
+    contributing a usable value anywhere in the window (not fewer than
+    `min_companies` pooled values — pooling 3 years can manufacture enough
+    raw values from just 1-2 companies to clear a value-count bar, which lets
+    a couple of outlier-prone companies in a thin industry dominate the
+    median; counting distinct companies matches the reliability bar used
+    everywhere else in this module, e.g. industry_metric_thresholds).
+    """
+    pooled = pd.concat(
+        [
+            pd.DataFrame({"Industry": industries, "Symbol": universe["Symbol"], "Value": pd.to_numeric(universe[col], errors="coerce")})
+            for col in columns
+        ],
+        ignore_index=True,
+    ).dropna(subset=["Value"])
+    counts = pooled.groupby("Industry")["Symbol"].nunique()
+    medians = pooled.groupby("Industry")["Value"].median()
+    return medians.where(counts >= min_companies)
+
+
+def industry_overview(universe: pd.DataFrame, min_companies: int = 5) -> pd.DataFrame:
+    """One row per Industry, treating the industry itself (not any one
+    company) as the unit of analysis: relative size, growth momentum, and
+    competitive intensity. Requires `universe` already merged with Market
+    Cap/PE (`merge_market_data`).
+
+    - `Companies`: every company in that Industry, regardless of data
+      completeness (how fragmented the universe itself is).
+    - `Market Cap (Cr)` / `Market Cap Share (%)`: relative size — the
+      industry's share of total universe Market Cap (sums to 100 across the
+      table). `sum(min_count=1)` so an industry with no Market Cap data at
+      all comes back `NaN`, not a misleading `0`.
+    - `HHI`: Herfindahl-Hirschman Index of *within-industry* market-cap
+      concentration (each company's share of its own industry's Market Cap,
+      squared, summed; 0-10,000 scale — one dominant player pushes this
+      toward 10,000, many similarly-sized players toward 0). The chosen proxy
+      for competitive intensity: independent of margins, so paired with
+      `Median OPM (%)` below it's a genuinely separate lens from the
+      Insights tab's margin-dispersion views, not a repeat of them.
+    - `Median OPM (%)` / `Median Rev Growth (%)`: latest-year margin level and
+      YoY revenue growth, industry-wide.
+    - `Growth Δ (pp)`: momentum — pooled median of `RevGrowth Y1-Y3 (%)`
+      (recent) minus pooled median of `RevGrowth Y4-Y6 (%)` (prior); positive
+      means accelerating, negative means decelerating. `NaN` when either
+      window is underpopulated (e.g. a recently-listed company can't have a
+      prior-window figure at all) via `_pooled_median`'s own `min_companies`
+      bar.
+    - `Median PE`: non-positive PE masked first, same convention as
+      `relative_valuation_passes`.
+    """
+    industries = universe["Industry"]
+    mcap = pd.to_numeric(universe["Market Cap (Cr)"], errors="coerce")
+
+    companies = industries.value_counts()
+    market_cap = mcap.groupby(industries).sum(min_count=1)
+    total_market_cap = market_cap.sum(min_count=1)
+    market_cap_share = (market_cap / total_market_cap * 100).round(2)
+
+    industry_total = mcap.groupby(industries).transform(lambda s: s.sum(min_count=1))
+    share_of_industry = mcap / industry_total * 100
+    hhi = (share_of_industry**2).groupby(industries).sum(min_count=1).round(1)
+
+    opm = pd.to_numeric(universe["OPM Y1 (%)"], errors="coerce")
+    median_opm = opm.groupby(industries).median().round(2)
+
+    rev_growth = pd.to_numeric(universe["RevGrowth Y1 (%)"], errors="coerce")
+    median_rev_growth = rev_growth.groupby(industries).median().round(2)
+
+    recent = _pooled_median(universe, industries, [f"RevGrowth Y{y} (%)" for y in (1, 2, 3)], min_companies)
+    prior = _pooled_median(universe, industries, [f"RevGrowth Y{y} (%)" for y in (4, 5, 6)], min_companies)
+    growth_delta = (recent - prior).round(2)
+
+    pe = pd.to_numeric(universe["PE"], errors="coerce")
+    pe = pe.where(pe > 0)
+    median_pe = pe.groupby(industries).median().round(2)
+
+    overview = pd.DataFrame(
+        {
+            "Companies": companies,
+            "Market Cap (Cr)": market_cap,
+            "Market Cap Share (%)": market_cap_share,
+            "HHI": hhi,
+            "Median OPM (%)": median_opm,
+            "Median Rev Growth (%)": median_rev_growth,
+            "Growth Δ (pp)": growth_delta,
+            "Median PE": median_pe,
+        }
+    )
+    return overview.rename_axis("Industry").reset_index()
 
 
 def metric_moat_passes(
@@ -1373,11 +1568,207 @@ def failure_detail(values: pd.Series, threshold: float, direction: str, consiste
     return f"fails in {len(failing)}/{len(values)} year(s): {parts}"
 
 
+def relative_valuation_passes(
+    universe: pd.DataFrame, percentile: float = 0.25, min_companies: int = 5, fallback: float = 20.0
+) -> tuple[pd.Series, pd.Series]:
+    """Tri-state pass/fail for "cheap vs its own industry" on P/E: True if a
+    company's PE is below its industry's `percentile`th percentile (default
+    bottom quartile — the industry's own cheapest tier), pd.NA if PE is
+    missing or non-positive. Non-positive PE (a loss-making company) is
+    masked here rather than in merge_market_data(), which deliberately leaves
+    PE as the vendor reports it for display elsewhere (e.g. Data Explorer's
+    Market metrics) — this screen is the first caller for which a negative/
+    zero PE is meaningless rather than just unusual. `fallback` (default 20 —
+    a commonly-cited long-run-average-market P/E) is used the same way every
+    MOAT_METRIC_CONFIG screen's "default" is: a flat, sensible absolute bar
+    for an industry with too few peers (`min_companies`) to have a meaningful
+    percentile of its own — not "nobody passes," matching how the rest of
+    the app treats a thin industry.
+
+    No Market Cap floor here — same "one comparison, caller ANDs the floor"
+    split net_net_passes() already established. Returns (passes, thresholds)
+    since pass/fail alone can't explain *how* cheap a failing company's own
+    industry bar was.
+    """
+    pe = pd.to_numeric(universe["PE"], errors="coerce")
+    pe = pe.where(pe > 0)
+    temp = universe[["Industry"]].assign(_PE=pe)
+    thresholds = industry_scalar_thresholds(temp, "_PE", percentile, min_companies, fallback)
+    passes = scalar_metric_passes(pe, thresholds, "lower")
+    return passes, thresholds
+
+
+def relative_valuation_scatter_frame(
+    universe: pd.DataFrame, quality_row: str, max_pe: float | None = None
+) -> pd.DataFrame:
+    """Symbol/Industry/quality-metric/PE/Market Cap, ready for a quality-vs-
+    valuation scatter — pairs a quality screen's own metric against P/E, a
+    comparison no single screen makes today (Relative Valuation and the
+    quality screens never look at each other). Non-positive PE is masked to
+    NaN, same convention as relative_valuation_passes() (a loss-making
+    company has no meaningful P/E). `max_pe` (`None`/`0` = no cap) is a
+    display-only ceiling to declutter extreme P/E outliers, same "0 = off"
+    convention as every other Max field in the app.
+    """
+    quality_col = f"{quality_row} Y1 (%)"
+    pe = pd.to_numeric(universe["PE"], errors="coerce")
+    pe = pe.where(pe > 0)
+
+    frame = pd.DataFrame({
+        "Symbol": universe["Symbol"],
+        "Industry": universe["Industry"],
+        quality_col: pd.to_numeric(universe[quality_col], errors="coerce"),
+        "PE": pe,
+        "Market Cap (Cr)": pd.to_numeric(universe["Market Cap (Cr)"], errors="coerce"),
+    })
+    frame = frame.dropna(subset=[quality_col, "PE"])
+    if max_pe:
+        frame = frame[frame["PE"] <= max_pe]
+    return frame
+
+
+# Every screen evaluate_screens_for_company()/portfolio_screen_overlay() report,
+# in emission order — (Filter label, Group). A single source of truth so the
+# "symbol not in cache" branch and the portfolio overlay's column list can't
+# drift from each other or from the real per-screen logic below.
+SCREEN_LABELS = (
+    [("SSGR", "SSGR")]
+    + [(cfg["label"], "Moats" if cfg["group"] == "moats" else "Nalanda's F") for cfg in MOAT_METRIC_CONFIG.values()]
+    + [("CCP – Regular ROCE", "CCP"), ("CCP – Nalanda's F", "CCP"), ("Vijay Malik", "Vijay Malik")]
+    + [(cfg["label"], "Vijay Malik Pro") for cfg in VIJAY_MALIK_PRO_CHECKS]
+    + [("Net-Net – Full Current Assets", "Net-Net"), ("Net-Net – Cash+Inv+Rec", "Net-Net")]
+    + [("Vantage", "Vantage")]
+    + [("Magic Formula – Plain WC", "Magic Formula"), ("Magic Formula – Ex Cash", "Magic Formula")]
+    + [("Relative Valuation (P/E)", "Valuation")]
+)
+
+
+def compute_universe_screens(universe: pd.DataFrame, overrides: dict) -> dict:
+    """Universe-wide pass/fail Series (plus whatever intermediate objects
+    each screen's failure-detail text needs) for every screen in
+    SCREEN_LABELS, computed once. Originally extracted out of
+    evaluate_screens_for_company() so a caller needing many companies'
+    verdicts in one page render (portfolio_screen_overlay()) doesn't redo
+    this ~2080-row computation once per company — every one of the
+    functions called below (industry_metric_thresholds, metric_moat_passes,
+    vijay_malik_passes, vijay_malik_pro_passes, net_net_passes,
+    vantage_metrics, magic_formula_ranking, relative_valuation_passes) takes
+    the *whole* universe and returns a full-length result, so this should
+    only ever run once per rerun, not once per company. Public (not a
+    leading-underscore helper) since `pages/screens.py`'s Insights tab also
+    reuses it directly, for the same reason — e.g. Moats/Vijay Malik Pro
+    Score for the score-distribution histogram, via moat_score() on
+    `result["moat"]`/`result["vijay_malik_pro"]["per_check"]`.
+    """
+    result: dict = {}
+
+    moat = {}
+    for key, config in MOAT_METRIC_CONFIG.items():
+        row_name = config["row"]
+        override = overrides.get(key, {})
+        use_industry = override.get("use_industry", True)
+        manual = override.get("manual", config["default"])
+        if use_industry:
+            thresholds = industry_metric_thresholds(
+                universe, row_name, config["percentile"], fallback=manual, consistency=config["consistency"]
+            )
+        else:
+            thresholds = pd.Series(manual, index=universe.index)
+        passes_all = metric_moat_passes(universe, row_name, thresholds, config["direction"], config["consistency"])
+        moat[key] = (thresholds, passes_all)
+    result["moat"] = moat
+
+    ccp_overrides = overrides.get("ccp", {})
+    roce_threshold = ccp_overrides.get("roce", 15)
+    growth_threshold = ccp_overrides.get("growth", 10)
+    years = ccp_overrides.get("years", 10)
+    roce_thresh_s = pd.Series(roce_threshold, index=universe.index)
+    growth_thresh_s = pd.Series(growth_threshold, index=universe.index)
+    growth_passes_all = metric_moat_passes(universe, "RevGrowth", growth_thresh_s, "higher", "all_years", years)
+    ccp = {
+        "growth_passes_all": growth_passes_all,
+        "roce_threshold": roce_threshold,
+        "growth_threshold": growth_threshold,
+        "years": years,
+        "lists": {},
+    }
+    for label, roce_row in [("CCP – Regular ROCE", "ROCE"), ("CCP – Nalanda's F", "ROCEExCash")]:
+        roce_passes_all = metric_moat_passes(universe, roce_row, roce_thresh_s, "higher", "all_years", years)
+        combined = and_tri_state(roce_passes_all, growth_passes_all)
+        ccp["lists"][label] = (combined, roce_passes_all, roce_row)
+    result["ccp"] = ccp
+
+    vm_thresholds = overrides.get("vijay_malik", {})
+    vm_per_check, vm_combined = vijay_malik_passes(universe, vm_thresholds)
+    result["vijay_malik"] = {"per_check": vm_per_check, "combined": vm_combined, "thresholds": vm_thresholds}
+
+    vmp_thresholds = overrides.get("vijay_malik_pro", {})
+    vmp_per_check = vijay_malik_pro_passes(universe, vmp_thresholds)
+    result["vijay_malik_pro"] = {"per_check": vmp_per_check, "thresholds": vmp_thresholds}
+
+    net_net_overrides = overrides.get("net_net", {})
+    min_mcap = net_net_overrides.get("min_mcap", 0.0)
+    mcap_series = pd.to_numeric(universe["Market Cap (Cr)"], errors="coerce")
+    mcap_floor_passes = scalar_metric_passes(mcap_series, min_mcap, "higher")
+    net_net = {"mcap_floor_passes": mcap_floor_passes, "min_mcap": min_mcap, "lists": {}}
+    for label, ncav_column in [
+        ("Net-Net – Full Current Assets", "NCAV Latest (Cr)"),
+        ("Net-Net – Cash+Inv+Rec", "NCAVCashInvRec Latest (Cr)"),
+    ]:
+        core_passes = net_net_passes(universe, ncav_column)
+        combined = and_tri_state(core_passes, mcap_floor_passes)
+        net_net["lists"][label] = (combined, core_passes, ncav_column)
+    result["net_net"] = net_net
+
+    vantage_overrides = overrides.get("vantage", {})
+    decay = vantage_overrides.get("decay", 0.85)
+    rate = vantage_overrides.get("rate", 0.10)
+    vantage_min_threshold = vantage_overrides.get("min_threshold", 0.0)
+    vantage_max_threshold = vantage_overrides.get("max_threshold", 1.0)
+    vantage_frame = vantage_metrics(universe, decay, rate)
+    multiple = vantage_frame["Multiple"]
+    above_min = scalar_metric_passes(multiple, vantage_min_threshold, "higher")
+    below_max = scalar_metric_passes(multiple, vantage_max_threshold, "lower")
+    result["vantage"] = {
+        "passes": and_tri_state(above_min, below_max),
+        "above_min": above_min,
+        "below_max": below_max,
+        "frame": vantage_frame,
+        "min_threshold": vantage_min_threshold,
+        "max_threshold": vantage_max_threshold,
+    }
+
+    magic_formula_overrides = overrides.get("magic_formula", {})
+    min_market_cap = magic_formula_overrides.get("min_market_cap", 5000.0)
+    magic_formula = {"min_market_cap": min_market_cap, "lists": {}}
+    for label, roc_column in [
+        ("Magic Formula – Plain WC", "MagicROC Latest (%)"),
+        ("Magic Formula – Ex Cash", "MagicROCExCash Latest (%)"),
+    ]:
+        magic_formula["lists"][label] = magic_formula_ranking(universe, roc_column, min_market_cap)
+    result["magic_formula"] = magic_formula
+
+    relval_overrides = overrides.get("relative_valuation", {})
+    relval_percentile = relval_overrides.get("percentile", 0.25)
+    relval_min_mcap = relval_overrides.get("min_market_cap", 0.0)
+    relval_core_passes, relval_thresholds = relative_valuation_passes(universe, relval_percentile)
+    relval_mcap_floor_passes = scalar_metric_passes(mcap_series, relval_min_mcap, "higher")
+    result["relative_valuation"] = {
+        "passes": and_tri_state(relval_core_passes, relval_mcap_floor_passes),
+        "core_passes": relval_core_passes,
+        "mcap_floor_passes": relval_mcap_floor_passes,
+        "thresholds": relval_thresholds,
+        "percentile": relval_percentile,
+        "min_market_cap": relval_min_mcap,
+    }
+
+    return result
+
+
 def evaluate_screens_for_company(universe: pd.DataFrame, symbol: str, overrides: dict) -> pd.DataFrame:
-    """Evaluate every screen (SSGR, all MOAT_METRIC_CONFIG entries, the 2 CCP
-    lists, Vijay Malik, all 9 Vijay Malik Pro checks, the 2 Net-Net lists,
-    Vantage, and the 2 Magic Formula rankings) for one company, using the same
-    formulas `pages/screens.py` uses for the whole universe. `overrides`
+    """Evaluate every screen in SCREEN_LABELS for one company, using the same
+    formulas `pages/screens.py` uses for the whole universe (via
+    compute_universe_screens(), computed once per call). `overrides`
     (resolved by the caller from st.session_state, kept out of this function
     to stay UI-free): {config_key: {"use_industry": bool, "manual": float}}
     for every MOAT_METRIC_CONFIG key, plus "ccp": {"roce": float, "growth":
@@ -1388,9 +1779,10 @@ def evaluate_screens_for_company(universe: pd.DataFrame, symbol: str, overrides:
     Market Cap floor both Net-Net lists apply on top of their own
     Mcap<NCAV comparison — mirrors how CCP's two ROCE variants share one
     revenue-growth check), "vantage": {"decay": float, "rate": float,
-    "min_threshold": float, "max_threshold": float}, and "magic_formula":
+    "min_threshold": float, "max_threshold": float}, "magic_formula":
     {"min_market_cap": float} (the pre-ranking eligibility floor shared by
-    both Magic Formula rankings). Returns one row per screen — Vijay Malik
+    both Magic Formula rankings), and "relative_valuation": {"percentile":
+    float, "min_market_cap": float}. Returns one row per screen — Vijay Malik
     Pro's 9 checks each get their own row (not AND-ed into one, unlike Vijay
     Malik/CCP — same "each trait is its own row" convention as the Moats
     checks; the combined 0-9 Score is a Screens-page ranking concept only,
@@ -1403,19 +1795,14 @@ def evaluate_screens_for_company(universe: pd.DataFrame, symbol: str, overrides:
     if match.empty:
         rows = [
             (label, group, pd.NA, "not in Screens cache — click Refresh on the Screens page")
-            for label, group in [("SSGR", "SSGR")]
-            + [(cfg["label"], "Moats" if cfg["group"] == "moats" else "Nalanda's F") for cfg in MOAT_METRIC_CONFIG.values()]
-            + [("CCP – Regular ROCE", "CCP"), ("CCP – Nalanda's F", "CCP"), ("Vijay Malik", "Vijay Malik")]
-            + [(cfg["label"], "Vijay Malik Pro") for cfg in VIJAY_MALIK_PRO_CHECKS]
-            + [("Net-Net – Full Current Assets", "Net-Net"), ("Net-Net – Cash+Inv+Rec", "Net-Net")]
-            + [("Vantage", "Vantage")]
-            + [("Magic Formula – Plain WC", "Magic Formula"), ("Magic Formula – Ex Cash", "Magic Formula")]
+            for label, group in SCREEN_LABELS
         ]
         return pd.DataFrame(rows, columns=columns)
 
     idx = match.index[0]
     urow = match.iloc[0]
     rows = []
+    shared = compute_universe_screens(universe, overrides)
 
     ssgr_pct, rev_cagr = urow["SSGR (%)"], urow["Rev 10Y CAGR (%)"]
     ssgr_passes = urow["SSGR Passes"]
@@ -1429,16 +1816,7 @@ def evaluate_screens_for_company(universe: pd.DataFrame, symbol: str, overrides:
 
     for key, config in MOAT_METRIC_CONFIG.items():
         row_name = config["row"]
-        override = overrides.get(key, {})
-        use_industry = override.get("use_industry", True)
-        manual = override.get("manual", config["default"])
-        if use_industry:
-            thresholds = industry_metric_thresholds(
-                universe, row_name, config["percentile"], fallback=manual, consistency=config["consistency"]
-            )
-        else:
-            thresholds = pd.Series(manual, index=universe.index)
-        passes_all = metric_moat_passes(universe, row_name, thresholds, config["direction"], config["consistency"])
+        thresholds, passes_all = shared["moat"][key]
         passes = passes_all.loc[idx]
         threshold_value = thresholds.loc[idx]
 
@@ -1453,17 +1831,13 @@ def evaluate_screens_for_company(universe: pd.DataFrame, symbol: str, overrides:
         group = "Moats" if config["group"] == "moats" else "Nalanda's F"
         rows.append((config["label"], group, passes, detail))
 
-    ccp = overrides.get("ccp", {})
-    roce_threshold = ccp.get("roce", 15)
-    growth_threshold = ccp.get("growth", 10)
-    years = ccp.get("years", 10)
-    roce_thresh_s = pd.Series(roce_threshold, index=universe.index)
-    growth_thresh_s = pd.Series(growth_threshold, index=universe.index)
-    growth_passes_all = metric_moat_passes(universe, "RevGrowth", growth_thresh_s, "higher", "all_years", years)
-
+    ccp = shared["ccp"]
+    growth_passes_all = ccp["growth_passes_all"]
+    roce_threshold = ccp["roce_threshold"]
+    growth_threshold = ccp["growth_threshold"]
+    years = ccp["years"]
     for label, roce_row in [("CCP – Regular ROCE", "ROCE"), ("CCP – Nalanda's F", "ROCEExCash")]:
-        roce_passes_all = metric_moat_passes(universe, roce_row, roce_thresh_s, "higher", "all_years", years)
-        combined = and_tri_state(roce_passes_all, growth_passes_all)
+        combined, roce_passes_all, _ = ccp["lists"][label]
         passes = combined.loc[idx]
 
         if pd.isna(passes):
@@ -1482,9 +1856,9 @@ def evaluate_screens_for_company(universe: pd.DataFrame, symbol: str, overrides:
 
         rows.append((label, "CCP", passes, detail))
 
-    vm_thresholds = overrides.get("vijay_malik", {})
-    vm_per_check, vm_combined = vijay_malik_passes(universe, vm_thresholds)
-    vm_passes = vm_combined.loc[idx]
+    vm_thresholds = shared["vijay_malik"]["thresholds"]
+    vm_per_check = shared["vijay_malik"]["per_check"]
+    vm_passes = shared["vijay_malik"]["combined"].loc[idx]
 
     if pd.isna(vm_passes):
         vm_detail = "not enough data"
@@ -1504,8 +1878,8 @@ def evaluate_screens_for_company(universe: pd.DataFrame, symbol: str, overrides:
 
     rows.append(("Vijay Malik", "Vijay Malik", vm_passes, vm_detail))
 
-    vmp_thresholds = overrides.get("vijay_malik_pro", {})
-    vmp_per_check = vijay_malik_pro_passes(universe, vmp_thresholds)
+    vmp_thresholds = shared["vijay_malik_pro"]["thresholds"]
+    vmp_per_check = shared["vijay_malik_pro"]["per_check"]
     for check in VIJAY_MALIK_PRO_CHECKS:
         key = check["key"]
         passes = vmp_per_check[key].loc[idx]
@@ -1539,17 +1913,14 @@ def evaluate_screens_for_company(universe: pd.DataFrame, symbol: str, overrides:
 
         rows.append((check["label"], "Vijay Malik Pro", passes, detail))
 
-    net_net_overrides = overrides.get("net_net", {})
-    min_mcap = net_net_overrides.get("min_mcap", 0.0)
-    mcap_series = pd.to_numeric(universe["Market Cap (Cr)"], errors="coerce")
-    mcap_floor_passes = scalar_metric_passes(mcap_series, min_mcap, "higher")
-
+    net_net = shared["net_net"]
+    min_mcap = net_net["min_mcap"]
+    mcap_floor_passes = net_net["mcap_floor_passes"]
     for label, ncav_column in [
         ("Net-Net – Full Current Assets", "NCAV Latest (Cr)"),
         ("Net-Net – Cash+Inv+Rec", "NCAVCashInvRec Latest (Cr)"),
     ]:
-        core_passes = net_net_passes(universe, ncav_column)
-        combined = and_tri_state(core_passes, mcap_floor_passes)
+        combined, core_passes, _ = net_net["lists"][label]
         passes = combined.loc[idx]
 
         if pd.isna(passes):
@@ -1568,47 +1939,42 @@ def evaluate_screens_for_company(universe: pd.DataFrame, symbol: str, overrides:
 
         rows.append((label, "Net-Net", passes, detail))
 
-    vantage_overrides = overrides.get("vantage", {})
-    decay = vantage_overrides.get("decay", 0.85)
-    rate = vantage_overrides.get("rate", 0.10)
-    min_threshold = vantage_overrides.get("min_threshold", 0.0)
-    max_threshold = vantage_overrides.get("max_threshold", 1.0)
-
-    vm = vantage_metrics(universe, decay, rate)
-    multiple = vm["Multiple"]
-    above_min = scalar_metric_passes(multiple, min_threshold, "higher")
-    below_max = scalar_metric_passes(multiple, max_threshold, "lower")
-    vantage_passes = and_tri_state(above_min, below_max).loc[idx]
+    vantage = shared["vantage"]
+    vantage_frame = vantage["frame"]
+    above_min = vantage["above_min"]
+    below_max = vantage["below_max"]
+    vantage_min_threshold = vantage["min_threshold"]
+    vantage_max_threshold = vantage["max_threshold"]
+    vantage_passes = vantage["passes"].loc[idx]
 
     if pd.isna(vantage_passes):
         vantage_detail = "not enough data"
     elif vantage_passes:
         vantage_detail = "—"
     else:
-        multiple_val = vm.loc[idx, "Multiple"]
-        mcap_val, tv_val = urow["Market Cap (Cr)"], vm.loc[idx, "Total Value (Cr)"]
+        multiple_val = vantage_frame.loc[idx, "Multiple"]
+        mcap_val, tv_val = urow["Market Cap (Cr)"], vantage_frame.loc[idx, "Total Value (Cr)"]
         reasons = []
         if above_min.loc[idx] is False:
             reasons.append(
                 f"Multiple {multiple_val:.2f} (Market Cap ₹{mcap_val:.2f} Cr / Total Value ₹{tv_val:.2f} Cr) "
-                f"is not above {min_threshold:.2f} (Total Value is negative — Loan swamps Cash)"
+                f"is not above {vantage_min_threshold:.2f} (Total Value is negative — Loan swamps Cash)"
                 if tv_val < 0
-                else f"Multiple {multiple_val:.2f} is not above {min_threshold:.2f}"
+                else f"Multiple {multiple_val:.2f} is not above {vantage_min_threshold:.2f}"
             )
         if below_max.loc[idx] is False:
-            reasons.append(f"Multiple {multiple_val:.2f} is not below {max_threshold:.2f}")
+            reasons.append(f"Multiple {multiple_val:.2f} is not below {vantage_max_threshold:.2f}")
         vantage_detail = "; ".join(reasons) if reasons else "not enough data"
 
     rows.append(("Vantage", "Vantage", vantage_passes, vantage_detail))
 
-    magic_formula_overrides = overrides.get("magic_formula", {})
-    min_market_cap = magic_formula_overrides.get("min_market_cap", 5000.0)
-
+    magic_formula = shared["magic_formula"]
+    min_market_cap = magic_formula["min_market_cap"]
     for label, roc_column in [
         ("Magic Formula – Plain WC", "MagicROC Latest (%)"),
         ("Magic Formula – Ex Cash", "MagicROCExCash Latest (%)"),
     ]:
-        ranked = magic_formula_ranking(universe, roc_column, min_market_cap)
+        ranked = magic_formula["lists"][label]
 
         if idx in ranked.index:
             magic_rank = ranked.loc[idx, "Magic Rank"]
@@ -1631,7 +1997,89 @@ def evaluate_screens_for_company(universe: pd.DataFrame, symbol: str, overrides:
 
         rows.append((label, "Magic Formula", mf_passes, mf_detail))
 
+    relval = shared["relative_valuation"]
+    relval_passes = relval["passes"].loc[idx]
+    if pd.isna(relval_passes):
+        relval_detail = "not enough data"
+    elif relval_passes:
+        relval_detail = "—"
+    else:
+        reasons = []
+        if relval["core_passes"].loc[idx] is False:
+            pe_val = pd.to_numeric(pd.Series([urow["PE"]]), errors="coerce").iloc[0]
+            threshold_val = relval["thresholds"].loc[idx]
+            reasons.append(
+                f"PE {pe_val:.2f} is not below the industry's {int(relval['percentile'] * 100)}th "
+                f"percentile {threshold_val:.2f}"
+            )
+        if relval["mcap_floor_passes"].loc[idx] is False:
+            mcap_val = urow["Market Cap (Cr)"]
+            reasons.append(f"Market Cap ₹{mcap_val:.2f} Cr is not above the floor ₹{relval['min_market_cap']:.2f} Cr")
+        relval_detail = "; ".join(reasons) if reasons else "not enough data"
+
+    rows.append(("Relative Valuation (P/E)", "Valuation", relval_passes, relval_detail))
+
     return pd.DataFrame(rows, columns=columns)
+
+
+def portfolio_screen_overlay(universe: pd.DataFrame, holdings: pd.DataFrame, overrides: dict | None = None) -> pd.DataFrame:
+    """Every screen's pass/fail for every portfolio holding — one row per
+    holding, one column per screen (the same labels SCREEN_LABELS/
+    evaluate_screens_for_company use), plus a "Screens Passed" count (reuses
+    moat_score() — True cells only, pd.NA/False both contribute 0).
+
+    Calls compute_universe_screens() once (not once per holding) and slices
+    each precomputed Series per holding — looping evaluate_screens_for_company
+    itself here would redo its full universe-wide computation once per
+    holding, which for a few dozen holdings is dozens of Screens-page-equivalent
+    reruns in a single page render. A holding symbol not present in `universe`
+    gets pd.NA for every screen, mirroring evaluate_screens_for_company's own
+    not-found branch.
+    """
+    overrides = overrides or {}
+    shared = compute_universe_screens(universe, overrides)
+    screen_columns = [label for label, _ in SCREEN_LABELS]
+
+    rows = []
+    for symbol in holdings["Symbol"]:
+        match = universe.index[universe["Symbol"] == symbol]
+        if len(match) == 0:
+            rows.append({"Symbol": symbol, **{label: pd.NA for label in screen_columns}})
+            continue
+
+        idx = match[0]
+        row: dict = {"Symbol": symbol, "SSGR": universe.loc[idx, "SSGR Passes"]}
+
+        for key, config in MOAT_METRIC_CONFIG.items():
+            _, passes_all = shared["moat"][key]
+            row[config["label"]] = passes_all.loc[idx]
+
+        for label in ["CCP – Regular ROCE", "CCP – Nalanda's F"]:
+            combined, _, _ = shared["ccp"]["lists"][label]
+            row[label] = combined.loc[idx]
+
+        row["Vijay Malik"] = shared["vijay_malik"]["combined"].loc[idx]
+
+        for check in VIJAY_MALIK_PRO_CHECKS:
+            row[check["label"]] = shared["vijay_malik_pro"]["per_check"][check["key"]].loc[idx]
+
+        for label in ["Net-Net – Full Current Assets", "Net-Net – Cash+Inv+Rec"]:
+            combined, _, _ = shared["net_net"]["lists"][label]
+            row[label] = combined.loc[idx]
+
+        row["Vantage"] = shared["vantage"]["passes"].loc[idx]
+
+        for label in ["Magic Formula – Plain WC", "Magic Formula – Ex Cash"]:
+            ranked = shared["magic_formula"]["lists"][label]
+            row[label] = bool(ranked.loc[idx, "Magic Rank"] <= 10) if idx in ranked.index else pd.NA
+
+        row["Relative Valuation (P/E)"] = shared["relative_valuation"]["passes"].loc[idx]
+
+        rows.append(row)
+
+    result = pd.DataFrame(rows, columns=["Symbol", *screen_columns])
+    result["Screens Passed"] = moat_score({label: result[label] for label in screen_columns})
+    return result
 
 
 def load_universe_cache(path: str = UNIVERSE_CACHE_FILE) -> pd.DataFrame | None:

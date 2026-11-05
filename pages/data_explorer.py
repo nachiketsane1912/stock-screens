@@ -14,6 +14,7 @@ from data_loader import (
     load_universe_cache,
     merge_market_data,
 )
+from reports import build_company_report_html
 from tables import style_tri_state, tri_state_column_config
 
 TREND_CHARTS = [
@@ -68,6 +69,7 @@ if symbol:
     vantage_max_threshold = st.session_state.get("vantage_max_threshold_saved", 1.0)
 
     st.markdown("**Filters**")
+    filters_table = pd.DataFrame(columns=["Filter", "Group", "Passes", "Detail"])
     universe = load_universe_cache()
     if universe is None:
         st.info("Run the Screens page (click Refresh if it's never been run) to see filter results here.")
@@ -117,6 +119,10 @@ if symbol:
         overrides["magic_formula"] = {
             "min_market_cap": st.session_state.get("magic_formula_min_market_cap_saved", 5000.0),
         }
+        overrides["relative_valuation"] = {
+            "percentile": st.session_state.get("relval_percentile_saved", 0.25),
+            "min_market_cap": st.session_state.get("relval_min_market_cap_saved", 0.0),
+        }
         filters_table = evaluate_screens_for_company(universe, symbol, overrides)
         st.dataframe(
             style_tri_state(filters_table, ["Passes"]),
@@ -156,6 +162,16 @@ if symbol:
     vcol6.metric("Interest Serviceable (₹ Cr)", f"{vantage['interest_serviceable']:.2f}" if pd.notna(vantage["interest_serviceable"]) else "—")
     vcol7.metric("Value/Share (₹)", f"{vantage['value_per_share']:.2f}" if pd.notna(vantage["value_per_share"]) else "—")
     vcol8.metric("Multiple", f"{vantage['multiple']:.2f}" if pd.notna(vantage["multiple"]) else "—")
+
+    report_html = build_company_report_html(
+        symbol, view["industry"], filters_table, market, vantage, view["cagr"], view["quarterly_cagr"]
+    )
+    st.download_button(
+        "Download report",
+        data=report_html,
+        file_name=f"{symbol}_report.html",
+        mime="text/html",
+    )
 
     st.markdown("**Quarterly financials**")
     st.dataframe(view["quarterly"], use_container_width=True)
