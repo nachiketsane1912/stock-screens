@@ -528,6 +528,9 @@ def get_company_view(symbol: str, sheets: dict[str, pd.DataFrame]) -> dict:
     """Assemble everything about one company: industry + quarterly/IS/BS tables."""
     industry_row = sheets["Industry"].loc[sheets["Industry"]["Symbol"] == symbol]
     industry = industry_row["Industry"].iloc[0] if not industry_row.empty else "Unknown"
+    basic_industry = industry_row["Basic Industry"].iloc[0] if not industry_row.empty else "Unknown"
+    sector = industry_row["Sector"].iloc[0] if not industry_row.empty else "Unknown"
+    macro_sector = industry_row["Macro-economic Sector"].iloc[0] if not industry_row.empty else "Unknown"
 
     shares_by_year = _shares_by_year(sheets["BS"], symbol)
 
@@ -562,6 +565,9 @@ def get_company_view(symbol: str, sheets: dict[str, pd.DataFrame]) -> dict:
 
     return {
         "industry": industry,
+        "basic_industry": basic_industry,
+        "sector": sector,
+        "macro_sector": macro_sector,
         "quarterly": quarterly,
         "income_statement": income_statement,
         "balance_sheet": balance_sheet,
@@ -650,6 +656,9 @@ def build_universe_cache(
         row = {
             "Symbol": symbol,
             "Industry": view["industry"],
+            "Basic Industry": view["basic_industry"],
+            "Sector": view["sector"],
+            "Macro-economic Sector": view["macro_sector"],
             "SSGR (%)": screen["ssgr_pct"],
             "Rev 10Y CAGR (%)": screen["rev_cagr_10y_pct"],
             "SSGR Passes": screen["passes"],
@@ -947,21 +956,24 @@ def industry_metric_thresholds(
     min_companies: int = 5,
     fallback: float = 0.0,
     consistency: str = "all_years",
+    group_col: str = "Industry",
 ) -> pd.Series:
     """Per-row (aligned to `universe.index`) threshold: the `percentile`th
-    percentile of `row`'s value among companies sharing that row's Industry, or
-    `fallback` when that industry has fewer than `min_companies` companies with
-    a usable value. The basis is `row`'s latest-year value ("{row} Y1 (%)") for
-    `consistency="all_years"`, or each company's median across `Y1`..`Y10` for
-    `consistency="median"` — matching whichever window `metric_moat_passes`
-    screens on, so the industry bar reflects the same lens.
+    percentile of `row`'s value among companies sharing that row's
+    `group_col` (defaults to the "Industry" classification level; pass e.g.
+    "Basic Industry" for a tighter peer group), or `fallback` when that group
+    has fewer than `min_companies` companies with a usable value. The basis
+    is `row`'s latest-year value ("{row} Y1 (%)") for `consistency="all_years"`,
+    or each company's median across `Y1`..`Y10` for `consistency="median"` —
+    matching whichever window `metric_moat_passes` screens on, so the
+    industry bar reflects the same lens.
     """
     if consistency == "median":
         cols = [f"{row} Y{y} (%)" for y in range(1, 11)]
         basis = universe[cols].median(axis=1)
     else:
         basis = universe[f"{row} Y1 (%)"]
-    grouped = basis.groupby(universe["Industry"])
+    grouped = basis.groupby(universe[group_col])
     counts = grouped.transform("count")
     thresholds = grouped.transform(lambda s: s.quantile(percentile))
     return thresholds.where(counts >= min_companies, fallback)
@@ -973,32 +985,38 @@ def industry_scalar_thresholds(
     percentile: float,
     min_companies: int = 5,
     fallback: float = 0.0,
+    group_col: str = "Industry",
 ) -> pd.Series:
     """Per-company (aligned to universe.index) threshold: the `percentile`th
     percentile of `column`'s value among companies sharing that row's
-    Industry, or `fallback` when that industry has fewer than `min_companies`
-    companies with a usable value. The scalar-column counterpart of
-    industry_metric_thresholds — for an already-computed single value per
-    company (e.g. a 10Y CAGR) rather than a Y1..Y10 consistency history, so
-    there's no "median" vs "all_years" basis to choose between.
+    `group_col` (defaults to "Industry"; pass e.g. "Basic Industry" for a
+    tighter peer group), or `fallback` when that group has fewer than
+    `min_companies` companies with a usable value. The scalar-column
+    counterpart of industry_metric_thresholds — for an already-computed
+    single value per company (e.g. a 10Y CAGR) rather than a Y1..Y10
+    consistency history, so there's no "median" vs "all_years" basis to
+    choose between.
     """
     values = pd.to_numeric(universe[column], errors="coerce")
-    grouped = values.groupby(universe["Industry"])
+    grouped = values.groupby(universe[group_col])
     counts = grouped.transform("count")
     thresholds = grouped.transform(lambda s: s.quantile(percentile))
     return thresholds.where(counts >= min_companies, fallback)
 
 
 def industry_metric_heatmap_frame(
-    universe: pd.DataFrame, metrics: list[tuple[str, str, str]], min_companies: int = 5
+    universe: pd.DataFrame, metrics: list[tuple[str, str, str]], min_companies: int = 5, group_col: str = "Industry"
 ) -> pd.DataFrame:
     """Industry x metric frame for a heatmap: for each `(row, label,
-    direction)` in `metrics`, the industry's median of that row's latest-year
+    direction)` in `metrics`, the group's median of that row's latest-year
     value (`"{row} Y1 (%)"` if that column family exists, else `row` read
     directly — so an already-scalar column like `"SSGR (%)"` works too,
-    passed as `row` itself). Industries with fewer than `min_companies`
-    usable values are dropped, same reliability bar as
-    `industry_metric_thresholds`.
+    passed as `row` itself). Grouped by `group_col` (defaults to "Industry";
+    pass e.g. "Basic Industry" or "Sector" for a different classification
+    level — the output column is always labeled "Industry" regardless, so
+    callers/chart helpers never need to know which level was used). Groups
+    with fewer than `min_companies` usable values are dropped, same
+    reliability bar as `industry_metric_thresholds`.
 
     Each metric's values are then min-max normalized to 0-1 *within that
     metric's own column*, flipped for `direction="lower"` so `1.0` always
@@ -1009,16 +1027,17 @@ def industry_metric_heatmap_frame(
     Returns a long-format frame: Industry, Metric, Value (the real median,
     for a tooltip), Normalized (for color) — ready for `render_heatmap_chart`.
     """
+    groups = universe[group_col].rename("Industry")
     rows = []
     for row, label, direction in metrics:
         y1_col = f"{row} Y1 (%)"
         col = y1_col if y1_col in universe.columns else row
         values = pd.to_numeric(universe[col], errors="coerce")
-        grouped = values.groupby(universe["Industry"])
+        grouped = values.groupby(groups)
         counts = grouped.transform("count")
         medians = grouped.transform("median")
 
-        usable = pd.DataFrame({"Industry": universe["Industry"], "Median": medians, "Count": counts})
+        usable = pd.DataFrame({"Industry": groups, "Median": medians, "Count": counts})
         usable = usable[usable["Count"] >= min_companies].drop_duplicates("Industry")
         if usable.empty:
             continue
@@ -1038,20 +1057,24 @@ def industry_metric_heatmap_frame(
     return pd.DataFrame(rows, columns=["Industry", "Metric", "Value", "Normalized"])
 
 
-def industry_metric_spread_frame(universe: pd.DataFrame, row: str, min_companies: int = 5) -> pd.DataFrame:
+def industry_metric_spread_frame(
+    universe: pd.DataFrame, row: str, min_companies: int = 5, group_col: str = "Industry"
+) -> pd.DataFrame:
     """Symbol/Industry/Value for every company with a usable `"{row} Y1 (%)"`
-    value, restricted to industries with at least `min_companies` such
-    companies (same reliability bar as `industry_metric_thresholds`/
-    `industry_metric_heatmap_frame` — a single company can't look like
-    "divergence"). Raw, one row per company (not pre-aggregated into
-    quartiles) — ready for a box plot, whose composite mark computes its own
-    median/IQR/whiskers from these per-row values grouped by Industry.
+    value, restricted to groups (by `group_col`, defaults to "Industry") with
+    at least `min_companies` such companies (same reliability bar as
+    `industry_metric_thresholds`/`industry_metric_heatmap_frame` — a single
+    company can't look like "divergence"). The output column is always
+    labeled "Industry" regardless of `group_col`. Raw, one row per company
+    (not pre-aggregated into quartiles) — ready for a box plot, whose
+    composite mark computes its own median/IQR/whiskers from these per-row
+    values grouped by Industry.
     """
     col = f"{row} Y1 (%)"
     frame = pd.DataFrame(
         {
             "Symbol": universe["Symbol"],
-            "Industry": universe["Industry"],
+            "Industry": universe[group_col],
             "Value": pd.to_numeric(universe[col], errors="coerce"),
         }
     ).dropna(subset=["Value"])
@@ -1084,11 +1107,13 @@ def _pooled_median(universe: pd.DataFrame, industries: pd.Series, columns: list[
     return medians.where(counts >= min_companies)
 
 
-def industry_overview(universe: pd.DataFrame, min_companies: int = 5) -> pd.DataFrame:
-    """One row per Industry, treating the industry itself (not any one
-    company) as the unit of analysis: relative size, growth momentum, and
-    competitive intensity. Requires `universe` already merged with Market
-    Cap/PE (`merge_market_data`).
+def industry_overview(universe: pd.DataFrame, min_companies: int = 5, group_col: str = "Industry") -> pd.DataFrame:
+    """One row per group (by `group_col`, defaults to "Industry" — pass e.g.
+    "Basic Industry", "Sector" or "Macro-economic Sector" for a different
+    classification level; the output column is always labeled "Industry"
+    regardless), treating the group itself (not any one company) as the unit
+    of analysis: relative size, growth momentum, and competitive intensity.
+    Requires `universe` already merged with Market Cap/PE (`merge_market_data`).
 
     - `Companies`: every company in that Industry, regardless of data
       completeness (how fragmented the universe itself is).
@@ -1114,7 +1139,7 @@ def industry_overview(universe: pd.DataFrame, min_companies: int = 5) -> pd.Data
     - `Median PE`: non-positive PE masked first, same convention as
       `relative_valuation_passes`.
     """
-    industries = universe["Industry"]
+    industries = universe[group_col]
     mcap = pd.to_numeric(universe["Market Cap (Cr)"], errors="coerce")
 
     companies = industries.value_counts()
@@ -1153,6 +1178,55 @@ def industry_overview(universe: pd.DataFrame, min_companies: int = 5) -> pd.Data
         }
     )
     return overview.rename_axis("Industry").reset_index()
+
+
+def industry_revenue_concentration_trend(
+    universe: pd.DataFrame, group_col: str, group_value: str, years: int = 10
+) -> pd.Series:
+    """10-year trend of revenue-share HHI for one specific group (e.g. one
+    Basic Industry) — the Industries page scorecard's HHI is market-cap-based
+    but only ever a current snapshot (the `Market` sheet has no history), so
+    this is the closest available proxy for "how has concentration evolved":
+    each year, every company's share of *that year's* group-wide revenue,
+    squared and summed, 0-10,000 scale (same formula/scale as the snapshot
+    HHI, just revenue- instead of market-cap-based, and one value per year
+    instead of one value today).
+
+    `sum(min_count=1)` for both the yearly total and the squared-share sum —
+    same "NaN, not a misleading 0, when nobody in the group has data that
+    year" guard `industry_overview`'s own HHI column already uses. Returns a
+    `Y1`..`Y{years}` Series (Y1 = latest), same convention as every other
+    cached trend (`portfolio_metric_trend`, `aggregate_universe_by_year`) —
+    callers reverse it to chronological order before charting.
+    """
+    subset = universe[universe[group_col] == group_value]
+    result = {}
+    for y in range(1, years + 1):
+        rev = pd.to_numeric(subset[f"Rev Y{y} (Cr)"], errors="coerce")
+        total = rev.sum(min_count=1)
+        if pd.isna(total) or total == 0:
+            result[f"Y{y}"] = float("nan")
+            continue
+        shares = rev / total * 100
+        result[f"Y{y}"] = round(float((shares**2).sum(min_count=1)), 1)
+    return pd.Series(result)
+
+
+def industry_metric_median_trend(
+    universe: pd.DataFrame, group_col: str, group_value: str, row: str, years: int = 10
+) -> pd.Series:
+    """10-year trend of the per-year median of `"{row} Y{y} (%)"` across every
+    company in one specific group (e.g. one Basic Industry) — generic enough
+    to serve a margin trend (`row="OPM"`/`"NPM"`) or a growth trajectory
+    (`row="RevGrowth"`) with one function, since all three are already cached
+    in this exact `Y1..Y10 (%)` shape. Returns a `Y1`..`Y{years}` Series
+    (Y1 = latest), same convention as `industry_revenue_concentration_trend`.
+    """
+    subset = universe[universe[group_col] == group_value]
+    cols = [f"{row} Y{y} (%)" for y in range(1, years + 1)]
+    medians = subset[cols].apply(pd.to_numeric, errors="coerce").median()
+    medians.index = [f"Y{y}" for y in range(1, years + 1)]
+    return medians.round(2)
 
 
 def metric_moat_passes(
@@ -1584,29 +1658,33 @@ def failure_detail(values: pd.Series, threshold: float, direction: str, consiste
 def relative_valuation_passes(
     universe: pd.DataFrame, percentile: float = 0.25, min_companies: int = 5, fallback: float = 20.0
 ) -> tuple[pd.Series, pd.Series]:
-    """Tri-state pass/fail for "cheap vs its own industry" on P/E: True if a
-    company's PE is below its industry's `percentile`th percentile (default
-    bottom quartile — the industry's own cheapest tier), pd.NA if PE is
-    missing or non-positive. Non-positive PE (a loss-making company) is
-    masked here rather than in merge_market_data(), which deliberately leaves
-    PE as the vendor reports it for display elsewhere (e.g. Data Explorer's
-    Market metrics) — this screen is the first caller for which a negative/
-    zero PE is meaningless rather than just unusual. `fallback` (default 20 —
-    a commonly-cited long-run-average-market P/E) is used the same way every
+    """Tri-state pass/fail for "cheap vs its own peers" on P/E: True if a
+    company's PE is below its Basic Industry's `percentile`th percentile
+    (default bottom quartile — the peer group's own cheapest tier), pd.NA if
+    PE is missing or non-positive. Grouped by **Basic Industry** (the
+    tightest of the 4 classification levels), not the coarser "Industry"
+    column — a deliberate choice: "cheap vs peers" is only meaningful when
+    the peers are genuinely comparable, which the broader "Industry" level
+    can't guarantee. Non-positive PE (a loss-making company) is masked here
+    rather than in merge_market_data(), which deliberately leaves PE as the
+    vendor reports it for display elsewhere (e.g. Data Explorer's Market
+    metrics) — this screen is the first caller for which a negative/zero PE
+    is meaningless rather than just unusual. `fallback` (default 20 — a
+    commonly-cited long-run-average-market P/E) is used the same way every
     MOAT_METRIC_CONFIG screen's "default" is: a flat, sensible absolute bar
-    for an industry with too few peers (`min_companies`) to have a meaningful
-    percentile of its own — not "nobody passes," matching how the rest of
-    the app treats a thin industry.
+    for a Basic Industry with too few peers (`min_companies`) to have a
+    meaningful percentile of its own — not "nobody passes," matching how the
+    rest of the app treats a thin industry.
 
     No Market Cap floor here — same "one comparison, caller ANDs the floor"
     split net_net_passes() already established. Returns (passes, thresholds)
     since pass/fail alone can't explain *how* cheap a failing company's own
-    industry bar was.
+    peer-group bar was.
     """
     pe = pd.to_numeric(universe["PE"], errors="coerce")
     pe = pe.where(pe > 0)
-    temp = universe[["Industry"]].assign(_PE=pe)
-    thresholds = industry_scalar_thresholds(temp, "_PE", percentile, min_companies, fallback)
+    temp = universe[["Basic Industry"]].assign(_PE=pe)
+    thresholds = industry_scalar_thresholds(temp, "_PE", percentile, min_companies, fallback, group_col="Basic Industry")
     passes = scalar_metric_passes(pe, thresholds, "lower")
     return passes, thresholds
 

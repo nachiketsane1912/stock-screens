@@ -1,11 +1,14 @@
+import pandas as pd
 import streamlit as st
 
-from charts import render_bar_chart, render_boxplot_chart, render_heatmap_chart, render_scatter_chart
+from charts import render_bar_chart, render_boxplot_chart, render_heatmap_chart, render_scatter_chart, render_trend_chart
 from data_loader import (
     QUALITY_METRIC_OPTIONS,
     industry_metric_heatmap_frame,
+    industry_metric_median_trend,
     industry_metric_spread_frame,
     industry_overview,
+    industry_revenue_concentration_trend,
     load_raw,
     load_universe_cache,
     merge_market_data,
@@ -28,10 +31,18 @@ universe = merge_market_data(universe, sheets)
 st.caption(
     "Every screen on the Screens page ranks companies. This page ranks the industries they belong to: how big "
     "each one is, whether its growth is speeding up or slowing down, how competitive it looks internally, and "
-    "how its companies compare metric-by-metric."
+    "how its companies compare metric-by-metric. Pick a classification level below — every section on this "
+    "page re-renders at that granularity."
 )
 
-overview = industry_overview(universe).sort_values("Market Cap (Cr)", ascending=False)
+level = st.selectbox(
+    "Classification level",
+    ["Basic Industry", "Industry", "Sector", "Macro-economic Sector"],
+    index=1,
+    key="industries_level",
+)
+
+overview = industry_overview(universe, group_col=level).sort_values("Market Cap (Cr)", ascending=False)
 
 st.markdown("#### Industry scorecard")
 st.caption(
@@ -122,7 +133,7 @@ heatmap_metrics = [
     ("LowDebt", "Interest / Op. Profit", "lower"),
     ("SSGR (%)", "SSGR", "higher"),
 ]
-heatmap_frame = industry_metric_heatmap_frame(universe, heatmap_metrics)
+heatmap_frame = industry_metric_heatmap_frame(universe, heatmap_metrics, group_col=level)
 if heatmap_frame.empty:
     st.caption("Not enough data")
 else:
@@ -148,7 +159,7 @@ st.caption(
 )
 
 spread_label = st.selectbox("Metric", list(QUALITY_METRIC_OPTIONS.keys()), key="industries_spread_metric")
-spread_frame = industry_metric_spread_frame(universe, QUALITY_METRIC_OPTIONS[spread_label])
+spread_frame = industry_metric_spread_frame(universe, QUALITY_METRIC_OPTIONS[spread_label], group_col=level)
 
 if spread_frame.empty:
     st.caption("Not enough data")
@@ -162,3 +173,68 @@ else:
         f"Most divergent: **{iqr.index[0]}** (IQR {iqr.iloc[0]:.1f}pp). "
         f"Most convergent: **{iqr.index[-1]}** (IQR {iqr.iloc[-1]:.1f}pp)."
     )
+
+st.divider()
+
+st.markdown("#### Deep dive")
+st.caption(
+    "Pick one industry (at the classification level chosen above) to see how it's changed over the last "
+    "10 fiscal years, not just where it stands today."
+)
+
+drill_options = overview["Industry"].tolist()
+selected = st.selectbox("Drill into", drill_options, index=0, key="industries_drill_into")
+selected_row = overview.loc[overview["Industry"] == selected].iloc[0]
+
+m1, m2, m3, m4 = st.columns(4)
+m1.metric("Companies", f"{selected_row['Companies']:.0f}")
+m2.metric(
+    "Market Cap",
+    f"₹{selected_row['Market Cap (Cr)']:,.0f} Cr" if pd.notna(selected_row["Market Cap (Cr)"]) else "—",
+)
+m3.metric(
+    "Market Cap Share",
+    f"{selected_row['Market Cap Share (%)']:.2f}%" if pd.notna(selected_row["Market Cap Share (%)"]) else "—",
+)
+m4.metric("HHI (today, Market Cap)", f"{selected_row['HHI']:.0f}" if pd.notna(selected_row["HHI"]) else "—")
+
+st.markdown("##### Competitive intensity over time")
+st.caption(
+    "Revenue-share HHI, not the Market-Cap HHI above — we only have today's Market Cap, not 10 years of "
+    "it, so each company's share of the industry's own revenue each year is the closest available proxy for "
+    "concentration. Rising means the industry is consolidating; falling means it's fragmenting."
+)
+concentration_trend = industry_revenue_concentration_trend(universe, level, selected).iloc[::-1]
+render_trend_chart(pd.DataFrame({"Revenue-share HHI": concentration_trend}), x_field="Year", x_type="N")
+
+st.markdown("##### Margin trend")
+st.caption("Median Operating Margin and Net Margin across the industry's companies, by fiscal year.")
+margin_frame = pd.DataFrame(
+    {
+        "Operating Margin (%)": industry_metric_median_trend(universe, level, selected, "OPM").iloc[::-1],
+        "Net Margin (%)": industry_metric_median_trend(universe, level, selected, "NPM").iloc[::-1],
+    }
+)
+render_trend_chart(margin_frame, x_field="Year", x_type="N")
+
+st.markdown("##### Revenue growth trajectory")
+st.caption("Median YoY revenue growth across the industry's companies, by fiscal year.")
+growth_trend = industry_metric_median_trend(universe, level, selected, "RevGrowth").iloc[::-1]
+render_trend_chart(pd.DataFrame({"Revenue Growth (%)": growth_trend}), x_field="Year", x_type="N")
+
+st.markdown("##### Company roster")
+roster = universe.loc[
+    universe[level] == selected, ["Symbol", "ROCE Y1 (%)", "OPM Y1 (%)", "Rev Y1 (Cr)", "Market Cap (Cr)", "PE"]
+].sort_values("Market Cap (Cr)", ascending=False)
+st.dataframe(
+    roster,
+    use_container_width=True,
+    hide_index=True,
+    column_config={
+        "ROCE Y1 (%)": st.column_config.NumberColumn(format="%.2f%%"),
+        "OPM Y1 (%)": st.column_config.NumberColumn(format="%.2f%%"),
+        "Rev Y1 (Cr)": st.column_config.NumberColumn(format="₹ %,.2f"),
+        "Market Cap (Cr)": st.column_config.NumberColumn(format="₹ %,.2f"),
+        "PE": st.column_config.NumberColumn(format="%.2f"),
+    },
+)

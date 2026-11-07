@@ -31,9 +31,11 @@ from data_loader import (
     failure_detail,
     get_company_view,
     industry_metric_heatmap_frame,
+    industry_metric_median_trend,
     industry_metric_spread_frame,
     industry_metric_thresholds,
     industry_overview,
+    industry_revenue_concentration_trend,
     industry_scalar_thresholds,
     load_universe_cache,
     macro_latest_snapshot,
@@ -398,7 +400,13 @@ def test_get_company_view_end_to_end():
         "Dep": [0.05 * r for r in rev_q], "Net": [0.1 * r for r in rev_q],
     }, quarters)
 
-    industry_sheet = pd.DataFrame({"Symbol": ["AAA"], "Industry": ["Test Industry"]})
+    industry_sheet = pd.DataFrame({
+        "Symbol": ["AAA"],
+        "Basic Industry": ["Test Basic Industry"],
+        "Industry": ["Test Industry"],
+        "Sector": ["Test Sector"],
+        "Macro-economic Sector": ["Test Macro Sector"],
+    })
     sheets = {"Industry": industry_sheet, "Quarter": quarter_sheet, "IS": is_sheet, "BS": bs_sheet}
 
     view = get_company_view("AAA", sheets)
@@ -445,7 +453,13 @@ def _market_fixture_sheets(market_row: dict | None) -> dict[str, pd.DataFrame]:
         "Rev": [25.0] * 4, "Exp": [15.0] * 4, "OI": [0.0] * 4, "Int": [0.0] * 4, "Dep": [1.0] * 4, "Net": [2.5] * 4,
     }, ["Q127", "Q426", "Q326", "Q226"])
 
-    industry_sheet = pd.DataFrame({"Symbol": ["AAA"], "Industry": ["Test Industry"]})
+    industry_sheet = pd.DataFrame({
+        "Symbol": ["AAA"],
+        "Basic Industry": ["Test Basic Industry"],
+        "Industry": ["Test Industry"],
+        "Sector": ["Test Sector"],
+        "Macro-economic Sector": ["Test Macro Sector"],
+    })
     sheets = {"Industry": industry_sheet, "Quarter": quarter_sheet, "IS": is_sheet, "BS": bs_sheet}
     if market_row is not None:
         sheets["Market"] = pd.DataFrame([market_row])
@@ -802,7 +816,13 @@ def test_build_universe_cache_returns_one_row_per_symbol_and_reports_progress():
     }, ["Q127", "Q426", "Q326", "Q226"])
 
     sheets = {
-        "Industry": pd.DataFrame({"Symbol": ["AAA", "BBB"], "Industry": ["Ind A", "Ind B"]}),
+        "Industry": pd.DataFrame({
+            "Symbol": ["AAA", "BBB"],
+            "Basic Industry": ["Basic A", "Basic B"],
+            "Industry": ["Ind A", "Ind B"],
+            "Sector": ["Sector A", "Sector B"],
+            "Macro-economic Sector": ["Macro A", "Macro B"],
+        }),
         "Quarter": pd.concat([quarter_aaa, quarter_bbb], ignore_index=True),
         "IS": pd.concat([is_aaa, is_bbb], ignore_index=True),
         "BS": pd.concat([bs_aaa, bs_bbb], ignore_index=True),
@@ -814,7 +834,8 @@ def test_build_universe_cache_returns_one_row_per_symbol_and_reports_progress():
     )
 
     expected_cols = {
-        "Symbol", "Industry", "SSGR (%)", "Rev 10Y CAGR (%)", "SSGR Passes",
+        "Symbol", "Industry", "Basic Industry", "Sector", "Macro-economic Sector",
+        "SSGR (%)", "Rev 10Y CAGR (%)", "SSGR Passes",
         "Net 10Y CAGR (%)", "DebtEquity Latest (%)", "CFO Latest (Cr)", "NCAV Latest (Cr)",
         "NCAVCashInvRec Latest (Cr)", "Cash Latest (Cr)",
         "PBIT Latest (Cr)", "TotalLiabExEquity Latest (Cr)", "MagicROC Latest (%)", "MagicROCExCash Latest (%)",
@@ -926,6 +947,31 @@ def test_industry_metric_thresholds_percentile_and_small_industry_fallback():
     assert big_threshold.iloc[0] == pytest.approx(expected_big)
 
     small_threshold = result[universe["Industry"] == "Small"]
+    assert (small_threshold == 40.0).all()  # only 2 companies -> falls back
+
+
+def test_industry_metric_thresholds_respects_group_col():
+    # All 7 companies share one "Industry" (would be a single, large group),
+    # but split into two 5/2 "Basic Industry" groups — grouping by
+    # "Basic Industry" should reproduce the Big/Small split from the test
+    # above, not the "Industry" column's single group.
+    universe = pd.DataFrame({
+        "Symbol": ["A1", "A2", "A3", "A4", "A5", "B1", "B2"],
+        "Industry": ["Everything"] * 7,
+        "Basic Industry": ["Big"] * 5 + ["Small"] * 2,
+        "OPM Y1 (%)": [10.0, 20.0, 30.0, 40.0, 50.0, 60.0, 70.0],
+    })
+
+    result = industry_metric_thresholds(
+        universe, "OPM", percentile=0.75, min_companies=5, fallback=40.0, group_col="Basic Industry"
+    )
+
+    big_threshold = result[universe["Basic Industry"] == "Big"]
+    expected_big = universe[universe["Basic Industry"] == "Big"]["OPM Y1 (%)"].quantile(0.75)
+    assert big_threshold.nunique() == 1
+    assert big_threshold.iloc[0] == pytest.approx(expected_big)
+
+    small_threshold = result[universe["Basic Industry"] == "Small"]
     assert (small_threshold == 40.0).all()  # only 2 companies -> falls back
 
 
@@ -1047,6 +1093,27 @@ def test_industry_scalar_thresholds_percentile_and_small_industry_fallback():
     assert (small_threshold == 15.0).all()  # only 2 companies -> falls back
 
 
+def test_industry_scalar_thresholds_respects_group_col():
+    universe = pd.DataFrame({
+        "Symbol": ["A1", "A2", "A3", "A4", "A5", "B1", "B2"],
+        "Industry": ["Everything"] * 7,
+        "Basic Industry": ["Big"] * 5 + ["Small"] * 2,
+        "Rev 10Y CAGR (%)": [10.0, 20.0, 30.0, 40.0, 50.0, 60.0, 70.0],
+    })
+
+    result = industry_scalar_thresholds(
+        universe, "Rev 10Y CAGR (%)", percentile=0.75, min_companies=5, fallback=15.0, group_col="Basic Industry"
+    )
+
+    big_threshold = result[universe["Basic Industry"] == "Big"]
+    expected_big = universe[universe["Basic Industry"] == "Big"]["Rev 10Y CAGR (%)"].quantile(0.75)
+    assert big_threshold.nunique() == 1
+    assert big_threshold.iloc[0] == pytest.approx(expected_big)
+
+    small_threshold = result[universe["Basic Industry"] == "Small"]
+    assert (small_threshold == 15.0).all()  # only 2 companies -> falls back
+
+
 def test_industry_scalar_thresholds_nan_value_does_not_count_toward_min_companies():
     universe = pd.DataFrame({
         "Symbol": ["A1", "A2", "A3", "A4", "A5"],
@@ -1066,6 +1133,7 @@ def test_relative_valuation_passes_below_industry_percentile():
     universe = pd.DataFrame({
         "Symbol": ["A1", "A2", "A3", "A4", "A5"],
         "Industry": ["Big"] * 5,
+        "Basic Industry": ["Big"] * 5,
         "PE": [10.0, 20.0, 30.0, 40.0, 50.0],
     })
 
@@ -1083,6 +1151,7 @@ def test_relative_valuation_passes_masks_non_positive_pe():
     universe = pd.DataFrame({
         "Symbol": ["LOSS", "ZERO", "CHEAP"],
         "Industry": ["Ind X"] * 3,
+        "Basic Industry": ["Ind X"] * 3,
         "PE": [-5.0, 0.0, 10.0],
     })
 
@@ -1099,6 +1168,7 @@ def test_relative_valuation_passes_thin_industry_falls_back_to_flat_default():
     universe = pd.DataFrame({
         "Symbol": ["CHEAP", "PRICEY"],
         "Industry": ["Ind X"] * 2,
+        "Basic Industry": ["Ind X"] * 2,
         "PE": [15.0, 25.0],
     })
 
@@ -1107,6 +1177,24 @@ def test_relative_valuation_passes_thin_industry_falls_back_to_flat_default():
     assert (thresholds == 20.0).all()
     assert passes.iloc[0] is True  # 15 < 20
     assert passes.iloc[1] is False  # 25 is not < 20
+
+
+def test_relative_valuation_passes_groups_by_basic_industry():
+    # All 5 companies share one "Industry" (would give a single 5-company
+    # group with a real percentile), but split 2/3 by "Basic Industry" — if
+    # the screen is actually grouping by Basic Industry rather than Industry,
+    # both groups are too thin (< min_companies=5) and must fall back to the
+    # flat default for everyone, not compute a real 5-company percentile.
+    universe = pd.DataFrame({
+        "Symbol": ["A1", "A2", "B1", "B2", "B3"],
+        "Industry": ["Everything"] * 5,
+        "Basic Industry": ["X"] * 2 + ["Y"] * 3,
+        "PE": [10.0, 20.0, 30.0, 40.0, 50.0],
+    })
+
+    passes, thresholds = relative_valuation_passes(universe, percentile=0.25, fallback=20.0)
+
+    assert (thresholds == 20.0).all()
 
 
 # --- relative_valuation_scatter_frame ----------------------------------------------
@@ -1211,6 +1299,26 @@ def test_industry_metric_heatmap_frame_reads_scalar_column_directly():
     assert result.iloc[0]["Value"] == pytest.approx(30.0)
 
 
+def test_industry_metric_heatmap_frame_respects_group_col():
+    # One company has a much higher SSGR; grouped by "Industry" it's pooled
+    # in with the rest (median unaffected by the lone outlier group split),
+    # but grouped by "Basic Industry" it forms its own one-company group,
+    # which is below min_companies and should be dropped from the output.
+    universe = pd.DataFrame({
+        "Symbol": [f"A{i}" for i in range(5)],
+        "Industry": ["Big"] * 5,
+        "Basic Industry": ["Big"] * 4 + ["Niche"] * 1,
+        "SSGR (%)": [10.0, 20.0, 30.0, 40.0, 999.0],
+    })
+
+    result = industry_metric_heatmap_frame(
+        universe, [("SSGR (%)", "SSGR", "higher")], min_companies=5, group_col="Basic Industry"
+    )
+
+    # Neither "Big" (4 companies) nor "Niche" (1 company) clears min_companies=5.
+    assert result.empty
+
+
 # --- industry_metric_spread_frame ---------------------------------------------------
 
 def test_industry_metric_spread_frame_returns_raw_rows_per_company():
@@ -1224,7 +1332,22 @@ def test_industry_metric_spread_frame_returns_raw_rows_per_company():
 
     assert len(result) == 5
     assert set(result.columns) == {"Symbol", "Industry", "Value"}
-    assert sorted(result["Value"]) == [10.0, 20.0, 30.0, 40.0, 50.0]
+
+
+def test_industry_metric_spread_frame_respects_group_col():
+    universe = pd.DataFrame({
+        "Symbol": [f"A{i}" for i in range(5)],
+        "Industry": ["Big"] * 5,
+        "Basic Industry": ["X"] * 2 + ["Y"] * 3,
+        "ROCE Y1 (%)": [10.0, 20.0, 30.0, 40.0, 50.0],
+    })
+
+    result = industry_metric_spread_frame(universe, "ROCE", min_companies=3, group_col="Basic Industry")
+
+    # Only "Y" (3 companies) clears min_companies=3; "X" (2 companies) is dropped.
+    assert len(result) == 3
+    assert set(result["Industry"]) == {"Y"}
+    assert sorted(result["Value"]) == [30.0, 40.0, 50.0]
 
 
 def test_industry_metric_spread_frame_drops_thin_industries():
@@ -1282,6 +1405,26 @@ def test_industry_overview_market_cap_share_sums_to_100_and_splits_correctly():
     assert result["Market Cap Share (%)"].sum() == pytest.approx(100.0)
     alpha_share = result.loc[result["Industry"] == "Alpha", "Market Cap Share (%)"].iloc[0]
     assert alpha_share == pytest.approx(50.0)  # (700+300) / (700+300+1000) * 100
+
+
+def test_industry_overview_respects_group_col():
+    # Same 3 companies as the test above, but "Industry" now lumps everyone
+    # into one group while "Basic Industry" preserves the Alpha/Beta split —
+    # grouping by "Basic Industry" should reproduce that same 50/50 split,
+    # and the output's grouping column should still be labeled "Industry".
+    universe = _industry_overview_fixture({
+        "Symbol": ["A1", "A2", "B1"],
+        "Industry": ["Everything"] * 3,
+        "Basic Industry": ["Alpha", "Alpha", "Beta"],
+        "Market Cap (Cr)": [700.0, 300.0, 1000.0],
+    })
+
+    result = industry_overview(universe, min_companies=1, group_col="Basic Industry")
+
+    assert list(result.columns)[0] == "Industry"
+    assert set(result["Industry"]) == {"Alpha", "Beta"}
+    alpha_share = result.loc[result["Industry"] == "Alpha", "Market Cap Share (%)"].iloc[0]
+    assert alpha_share == pytest.approx(50.0)
 
 
 def test_industry_overview_hhi_known_split():
@@ -1386,6 +1529,78 @@ def test_industry_overview_companies_count_includes_all_regardless_of_data():
     result = industry_overview(universe, min_companies=1)
 
     assert result.loc[result["Industry"] == "Mixed", "Companies"].iloc[0] == 3
+
+
+# --- industry_revenue_concentration_trend --------------------------------------------
+
+def test_industry_revenue_concentration_trend_known_split():
+    universe = pd.DataFrame({
+        "Symbol": ["A1", "A2"],
+        "Industry": ["Big", "Big"],
+        "Rev Y1 (Cr)": [70.0, 30.0],
+        "Rev Y2 (Cr)": [50.0, 50.0],
+    })
+
+    result = industry_revenue_concentration_trend(universe, "Industry", "Big", years=2)
+
+    assert result["Y1"] == pytest.approx(5800.0)  # 70^2 + 30^2
+    assert result["Y2"] == pytest.approx(5000.0)  # 50^2 + 50^2
+
+
+def test_industry_revenue_concentration_trend_all_missing_year_is_nan():
+    universe = pd.DataFrame({
+        "Symbol": ["A1", "A2"],
+        "Industry": ["Big", "Big"],
+        "Rev Y1 (Cr)": [70.0, 30.0],
+        "Rev Y2 (Cr)": [float("nan"), float("nan")],
+    })
+
+    result = industry_revenue_concentration_trend(universe, "Industry", "Big", years=2)
+
+    assert result["Y1"] == pytest.approx(5800.0)
+    assert pd.isna(result["Y2"])
+
+
+def test_industry_revenue_concentration_trend_filters_to_group_value():
+    universe = pd.DataFrame({
+        "Symbol": ["A1", "A2", "B1"],
+        "Industry": ["Big", "Big", "Other"],
+        # B1's huge revenue must not leak into "Big"'s HHI.
+        "Rev Y1 (Cr)": [70.0, 30.0, 1000.0],
+    })
+
+    result = industry_revenue_concentration_trend(universe, "Industry", "Big", years=1)
+
+    assert result["Y1"] == pytest.approx(5800.0)
+
+
+# --- industry_metric_median_trend -----------------------------------------------------
+
+def test_industry_metric_median_trend_basic():
+    universe = pd.DataFrame({
+        "Symbol": ["A1", "A2", "A3"],
+        "Industry": ["Big"] * 3,
+        "OPM Y1 (%)": [10.0, 20.0, 30.0],
+        "OPM Y2 (%)": [5.0, 15.0, 25.0],
+    })
+
+    result = industry_metric_median_trend(universe, "Industry", "Big", "OPM", years=2)
+
+    assert result["Y1"] == pytest.approx(20.0)
+    assert result["Y2"] == pytest.approx(15.0)
+
+
+def test_industry_metric_median_trend_filters_to_group_value():
+    universe = pd.DataFrame({
+        "Symbol": ["A1", "A2", "B1"],
+        "Industry": ["Big", "Big", "Other"],
+        # "Other"'s extreme value must not leak into "Big"'s median.
+        "OPM Y1 (%)": [10.0, 20.0, 999.0],
+    })
+
+    result = industry_metric_median_trend(universe, "Industry", "Big", "OPM", years=1)
+
+    assert result["Y1"] == pytest.approx(15.0)
 
 
 # --- portfolio_metric_trend ---------------------------------------------------------
@@ -1887,15 +2102,19 @@ def make_universe_df(companies: list[dict]) -> pd.DataFrame:
     "net_cagr"/"debt_equity"/"cfo"/"market_cap"/"ncav"/"ncav_cash_inv_rec"/
     "cash_latest"/"vantage_cfo"/"vantage_int" (the last two as 10-value lists)/
     "pbit"/"total_liab_ex_equity"/"magic_roc"/"magic_roc_ex_cash"/
-    "tax_payout_ratio"/"interest_coverage"/"current_ratio", and optionally
-    a list of 10 values for any key in _COMFORTABLE_PASS_VALUES to override that
-    row (everything else defaults to a flat comfortable-pass value).
+    "tax_payout_ratio"/"interest_coverage"/"current_ratio"/"basic_industry"
+    (defaults to the same value as "Industry" when omitted, so every existing
+    fixture that doesn't care about the Basic Industry/Industry distinction
+    keeps behaving identically), and optionally a list of 10 values for any
+    key in _COMFORTABLE_PASS_VALUES to override that row (everything else
+    defaults to a flat comfortable-pass value).
     """
     records = []
     for company in companies:
         record = {
             "Symbol": company["Symbol"],
             "Industry": company["Industry"],
+            "Basic Industry": company.get("basic_industry", company["Industry"]),
             "SSGR (%)": company.get("ssgr_pct", 50.0),
             "Rev 10Y CAGR (%)": company.get("rev_cagr", 20.0),  # >15 (Vijay Malik) and <50 (SSGR default)
             "SSGR Passes": company.get("ssgr_passes", True),

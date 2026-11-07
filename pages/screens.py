@@ -107,8 +107,8 @@ def render_threshold_controls(
             value=True,
             key=f"{config_key}_use_industry",
             help=(
-                f"Each company is compared to its own industry's {pctl}th-percentile {config['label']}, "
-                "falling back to the manual value for industries with fewer than 5 companies."
+                f"Each company is compared to its own Basic Industry's {pctl}th-percentile {config['label']}, "
+                "falling back to the manual value for a Basic Industry with fewer than 5 companies."
             ),
         )
         manual_threshold = slider_col.slider(
@@ -142,7 +142,12 @@ def render_threshold_controls(
 
     if use_industry:
         thresholds = industry_metric_thresholds(
-            universe, row, config["percentile"], fallback=manual_threshold, consistency=config["consistency"]
+            universe,
+            row,
+            config["percentile"],
+            fallback=manual_threshold,
+            consistency=config["consistency"],
+            group_col="Basic Industry",
         )
     else:
         thresholds = pd.Series(manual_threshold, index=universe.index)
@@ -828,23 +833,23 @@ def render_magic_formula_tab(universe: pd.DataFrame) -> None:
 
 def render_relative_valuation_tab(universe: pd.DataFrame) -> None:
     """Relative Valuation tab: flag companies whose P/E sits below a chosen
-    percentile of their own industry's peers (default: bottom quartile) —
-    the first screen to read the Market sheet's PE at all. A thin industry
-    (too few peers with a usable P/E) falls back to a flat default bar, same
-    as every MOAT_METRIC_CONFIG screen's own fallback — see
+    percentile of their own Basic Industry peers (default: bottom quartile) —
+    the first screen to read the Market sheet's PE at all. A thin Basic
+    Industry (too few peers with a usable P/E) falls back to a flat default
+    bar, same as every MOAT_METRIC_CONFIG screen's own fallback — see
     relative_valuation_passes(). A Market Cap floor filters out illiquid
     micro-caps, same rationale Net-Net already established.
     """
     st.subheader("Relative Valuation")
     st.caption(
-        "Flags companies whose P/E is cheaper than a chosen percentile of their own industry's peers "
+        "Flags companies whose P/E is cheaper than a chosen percentile of their own Basic Industry peers "
         "(default: bottom quartile). Loss-making companies (negative/zero P/E) are excluded — a P/E "
         "isn't meaningful there. A Market Cap floor filters out illiquid micro-caps, same as Net-Net."
     )
 
     col1, col2 = st.columns(2)
     percentile_pct = col1.slider(
-        "Industry percentile (cheaper than)", min_value=5, max_value=50, value=25, step=5, key="relval_percentile"
+        "Basic Industry percentile (cheaper than)", min_value=5, max_value=50, value=25, step=5, key="relval_percentile"
     )
     min_market_cap = col2.number_input(
         "Min Market Cap (₹ Cr)", value=0.0, step=10.0, key="relval_min_market_cap"
@@ -863,9 +868,9 @@ def render_relative_valuation_tab(universe: pd.DataFrame) -> None:
 
     passing_mask = combined == True  # noqa: E712 (NA/False must not match)
     passing = universe[passing_mask].copy()
-    passing["Industry PE Threshold"] = thresholds[passing_mask].round(2)
+    passing["Basic Industry PE Threshold"] = thresholds[passing_mask].round(2)
     passing["Discount (%)"] = (
-        (passing["Industry PE Threshold"] - passing["PE"]) / passing["Industry PE Threshold"] * 100
+        (passing["Basic Industry PE Threshold"] - passing["PE"]) / passing["Basic Industry PE Threshold"] * 100
     ).round(2)
     passing = passing.sort_values("Discount (%)", ascending=False)
 
@@ -878,7 +883,7 @@ def render_relative_valuation_tab(universe: pd.DataFrame) -> None:
 
     st.caption(f"**{len(passing)}** of {len(universe)} companies pass")
 
-    display_cols = ["Symbol", "Industry", "PE", "Industry PE Threshold", "Market Cap (Cr)", "Discount (%)"]
+    display_cols = ["Symbol", "Industry", "PE", "Basic Industry PE Threshold", "Market Cap (Cr)", "Discount (%)"]
     event = st.dataframe(
         style_diverging(passing[display_cols].style, ["Discount (%)"]),
         use_container_width=True,
@@ -888,7 +893,7 @@ def render_relative_valuation_tab(universe: pd.DataFrame) -> None:
         key="relative_valuation_table",
         column_config={
             "PE": st.column_config.NumberColumn(format="%.2f"),
-            "Industry PE Threshold": st.column_config.NumberColumn(format="%.2f"),
+            "Basic Industry PE Threshold": st.column_config.NumberColumn(format="%.2f"),
             "Market Cap (Cr)": st.column_config.NumberColumn(format="₹ %,.2f"),
             "Discount (%)": st.column_config.NumberColumn(format="%.2f%%"),
         },
